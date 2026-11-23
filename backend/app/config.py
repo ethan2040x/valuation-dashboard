@@ -34,11 +34,33 @@ EXPORT_OUTPUT_PATH = Path(
 DEFAULT_INSTRUMENT_SYMBOL = "NDX"
 DEFAULT_INSTRUMENT_NAME = "纳指 100"
 
+INSTRUMENTS: dict[str, dict[str, str]] = {
+    "NDX": {
+        "symbol": "NDX",
+        "name": "纳指 100",
+        "en_name": "Nasdaq-100",
+        "etf_ticker": "QQQ",
+        "description": "日频追踪纳指 100 (QQQ) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年历史估值分位",
+        "source_tag": "qqq+yfinance",
+        "seed_file": "ndx_pe_history.csv",
+    },
+    "SPY": {
+        "symbol": "SPY",
+        "name": "标普 500",
+        "en_name": "S&P 500",
+        "etf_ticker": "SPY",
+        "description": "日频追踪标普 500 (SPY) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年历史估值分位",
+        "source_tag": "spy+yfinance",
+        "seed_file": "spy_pe_history.csv",
+    },
+}
+
 # Higher priority comes earlier in the list.
 # When the same series has multiple sources on the same date, the first matching source wins.
 SOURCE_PRIORITY: list[str] = [
     "computed",
     "qqq+yfinance",
+    "spy+yfinance",
     "csv_import",
     "seed_csv",
 ]

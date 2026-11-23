@@ -1,5 +1,6 @@
 import type {
   IndicatorMeta,
+  InstrumentMeta,
   RangeKey,
   RefreshResult,
   SeriesPayload,
@@ -7,6 +8,23 @@ import type {
   StaticSnapshotBundle,
   ValuationDataProvider,
 } from "../types/valuation";
+
+const FALLBACK_INSTRUMENTS: InstrumentMeta[] = [
+  {
+    symbol: "NDX",
+    name: "纳指 100",
+    en_name: "Nasdaq-100",
+    etf_ticker: "QQQ",
+    description: "日频追踪纳指 100 (QQQ) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年历史估值分位",
+  },
+  {
+    symbol: "SPY",
+    name: "标普 500",
+    en_name: "S&P 500",
+    etf_ticker: "SPY",
+    description: "日频追踪标普 500 (SPY) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年历史估值分位",
+  },
+];
 
 class ApiDataProvider implements ValuationDataProvider {
   readonly mode = "dynamic" as const;
@@ -24,6 +42,15 @@ class ApiDataProvider implements ValuationDataProvider {
       throw new Error(`HTTP ${res.status}: ${text}`);
     }
     return (await res.json()) as T;
+  }
+
+  async getInstruments(): Promise<InstrumentMeta[]> {
+    try {
+      const list = await this.fetchJson<InstrumentMeta[]>("/api/instruments");
+      return list.length > 0 ? list : FALLBACK_INSTRUMENTS;
+    } catch {
+      return FALLBACK_INSTRUMENTS;
+    }
   }
 
   getIndicators(): Promise<IndicatorMeta[]> {
@@ -64,20 +91,35 @@ class SnapshotDataProvider implements ValuationDataProvider {
     this.snapshotGeneratedAt = bundle.generated_at;
   }
 
+  async getInstruments(): Promise<InstrumentMeta[]> {
+    if (this.bundle.instruments && this.bundle.instruments.length > 0) {
+      return this.bundle.instruments;
+    }
+    const sym = this.bundle.instrument.toUpperCase();
+    return FALLBACK_INSTRUMENTS.filter((i) => i.symbol === sym);
+  }
+
   async getIndicators(): Promise<IndicatorMeta[]> {
     return this.bundle.indicators;
   }
 
-  async getSnapshot(_instrument: string): Promise<SnapshotPayload> {
+  async getSnapshot(instrument: string): Promise<SnapshotPayload> {
+    const key = instrument.toUpperCase();
+    if (this.bundle.snapshots && this.bundle.snapshots[key]) {
+      return this.bundle.snapshots[key];
+    }
     return this.bundle.snapshot;
   }
 
   async getSeries(
     indicatorId: string,
-    _instrument: string,
+    instrument: string,
     range: RangeKey
   ): Promise<SeriesPayload> {
-    const byRange = this.bundle.series[indicatorId];
+    const key = instrument.toUpperCase();
+    const seriesMap =
+      this.bundle.series_by_instrument?.[key] ?? this.bundle.series;
+    const byRange = seriesMap[indicatorId];
     if (!byRange) {
       throw new Error(`快照中缺少指标序列: ${indicatorId}`);
     }

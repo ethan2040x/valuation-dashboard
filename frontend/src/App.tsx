@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createDataProvider } from "./data/provider";
 import type {
   IndicatorMeta,
+  InstrumentMeta,
   RangeKey,
   SeriesPayload,
   SnapshotPayload,
@@ -12,12 +13,14 @@ import { IndicatorCardRow } from "./widgets/IndicatorCardRow";
 import { PercentileBarSection } from "./widgets/PercentileBarSection";
 import { TrendChart } from "./widgets/TrendChart";
 
-const INSTRUMENT = "NDX";
+const DEFAULT_INSTRUMENT = "NDX";
 
 export const App: React.FC = () => {
   const provider = useMemo(() => createDataProvider(), []);
   const percentileRef = useRef<HTMLElement>(null);
 
+  const [instruments, setInstruments] = useState<InstrumentMeta[]>([]);
+  const [instrumentSymbol, setInstrumentSymbol] = useState<string>(DEFAULT_INSTRUMENT);
   const [indicators, setIndicators] = useState<IndicatorMeta[]>([]);
   const [snapshot, setSnapshot] = useState<SnapshotPayload | null>(null);
   const [selectedId, setSelectedId] = useState<string>("");
@@ -31,26 +34,32 @@ export const App: React.FC = () => {
     null
   );
 
-  const loadCore = useCallback(async () => {
-    const [inds, snap] = await Promise.all([
-      provider.getIndicators(),
-      provider.getSnapshot(INSTRUMENT),
-    ]);
-    setIndicators(inds);
-    setSnapshot(snap);
-    setSelectedId((prev) => {
-      if (prev && inds.some((i) => i.id === prev && i.display.chartable)) {
-        return prev;
-      }
-      const firstChartable = inds.find((i) => i.display.chartable);
-      return firstChartable?.id ?? inds[0]?.id ?? "";
-    });
-  }, [provider]);
+  const loadCore = useCallback(
+    async (symbol: string) => {
+      const [insts, inds, snap] = await Promise.all([
+        provider.getInstruments(),
+        provider.getIndicators(),
+        provider.getSnapshot(symbol),
+      ]);
+      setInstruments(insts);
+      setIndicators(inds);
+      setSnapshot(snap);
+      setSelectedId((prev) => {
+        if (prev && inds.some((i) => i.id === prev && i.display.chartable)) {
+          return prev;
+        }
+        const firstChartable = inds.find((i) => i.display.chartable);
+        return firstChartable?.id ?? inds[0]?.id ?? "";
+      });
+    },
+    [provider]
+  );
 
   useEffect(() => {
     let cancelled = false;
     setInitialLoading(true);
-    loadCore()
+    setBanner(null);
+    loadCore(instrumentSymbol)
       .catch((err) => {
         if (!cancelled) {
           setBanner({
@@ -65,14 +74,14 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [loadCore]);
+  }, [loadCore, instrumentSymbol]);
 
   const loadSeries = useCallback(
-    async (indicatorId: string, rangeKey: RangeKey) => {
+    async (indicatorId: string, symbol: string, rangeKey: RangeKey) => {
       if (!indicatorId) return;
       setSeriesLoading(true);
       try {
-        const data = await provider.getSeries(indicatorId, INSTRUMENT, rangeKey);
+        const data = await provider.getSeries(indicatorId, symbol, rangeKey);
         setSeriesPayload(data);
       } catch (err) {
         setBanner({
@@ -88,19 +97,38 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (selectedId) {
-      void loadSeries(selectedId, range);
+      void loadSeries(selectedId, instrumentSymbol, range);
     }
-  }, [selectedId, range, loadSeries]);
+  }, [selectedId, instrumentSymbol, range, loadSeries]);
+
+  const activeInstrument = useMemo(
+    () =>
+      instruments.find((i) => i.symbol === instrumentSymbol) ?? {
+        symbol: instrumentSymbol,
+        name: snapshot?.instrument.name ?? instrumentSymbol,
+        en_name: instrumentSymbol === "SPY" ? "S&P 500" : "Nasdaq-100",
+        etf_ticker: instrumentSymbol === "SPY" ? "SPY" : "QQQ",
+        description:
+          instrumentSymbol === "SPY"
+            ? "日频追踪标普 500 (SPY) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年历史估值分位"
+            : "日频追踪纳指 100 (QQQ) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年历史估值分位",
+      },
+    [instruments, instrumentSymbol, snapshot]
+  );
+
+  useEffect(() => {
+    document.title = `${activeInstrument.name} 估值看板`;
+  }, [activeInstrument.name]);
 
   const handleManualRefresh = async () => {
     if (!provider.triggerRefresh || refreshing) return;
     setRefreshing(true);
     setBanner(null);
     try {
-      const res = await provider.triggerRefresh(INSTRUMENT);
-      await loadCore();
+      const res = await provider.triggerRefresh(instrumentSymbol);
+      await loadCore(instrumentSymbol);
       if (selectedId) {
-        await loadSeries(selectedId, range);
+        await loadSeries(selectedId, instrumentSymbol, range);
       }
       if (res.status === "failed") {
         setBanner({
@@ -110,7 +138,7 @@ export const App: React.FC = () => {
       } else {
         setBanner({
           kind: "info",
-          text: `刷新完成（日期 ${res.as_of_date ?? "—"}，入库成分股 ${res.constituents_saved} 只）`,
+          text: `刷新完成（${activeInstrument.name} · 日期 ${res.as_of_date ?? "—"}，入库成分股 ${res.constituents_saved} 只）`,
         });
       }
     } catch (err) {
@@ -133,17 +161,35 @@ export const App: React.FC = () => {
       <header className="topbar">
         <div className="topbar__left">
           <div className="topbar__title-row">
-            <h1 className="topbar__title">纳指 100 估值看板</h1>
+            <h1 className="topbar__title">{activeInstrument.name} 估值看板</h1>
             <span className="instrument-pill">
-              {snapshot?.instrument.symbol ?? INSTRUMENT} · Nasdaq-100
+              {activeInstrument.symbol} · {activeInstrument.en_name}
             </span>
           </div>
-          <p className="topbar__desc">
-            日频追踪纳指 100 指数权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年历史估值分位
-          </p>
+          <p className="topbar__desc">{activeInstrument.description}</p>
         </div>
 
         <div className="topbar__right">
+          {instruments.length > 1 && (
+            <div className="instrument-switcher" role="tablist" aria-label="切换指数">
+              {instruments.map((inst) => (
+                <button
+                  key={inst.symbol}
+                  type="button"
+                  role="tab"
+                  aria-selected={inst.symbol === instrumentSymbol}
+                  className={`instrument-tab ${
+                    inst.symbol === instrumentSymbol ? "instrument-tab--active" : ""
+                  }`}
+                  onClick={() => setInstrumentSymbol(inst.symbol)}
+                >
+                  <span>{inst.name}</span>
+                  <span className="instrument-tab__sym">{inst.symbol}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
           {provider.mode === "static" ? (
             <div className="snapshot-stamp" title="离线静态快照，不依赖后端服务">
               <span className="snapshot-stamp__dot" />
@@ -160,7 +206,9 @@ export const App: React.FC = () => {
               disabled={refreshing || initialLoading}
             >
               <span className={refreshing ? "spin" : ""}>↻</span>
-              {refreshing ? "正在拉取 QQQ & yfinance…" : "手动刷新"}
+              {refreshing
+                ? `正在拉取 ${activeInstrument.etf_ticker} & yfinance…`
+                : "手动刷新"}
             </button>
           )}
         </div>

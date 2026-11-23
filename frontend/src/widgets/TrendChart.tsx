@@ -30,6 +30,7 @@ const SOURCE_STYLE: Record<
 > = {
   computed: { color: "#2563eb", lineType: "solid", width: 2.5 },
   "qqq+yfinance": { color: "#2563eb", lineType: "solid", width: 2.5 },
+  "spy+yfinance": { color: "#2563eb", lineType: "solid", width: 2.5 },
   csv_import: { color: "#0f766e", lineType: "dashed", width: 2 },
   seed_csv: { color: "#64748b", lineType: "dashed", width: 2 },
 };

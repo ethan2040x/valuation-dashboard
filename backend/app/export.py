@@ -15,12 +15,14 @@ from typing import Any
 from app.config import (
     DEFAULT_INSTRUMENT_SYMBOL,
     EXPORT_OUTPUT_PATH,
+    INSTRUMENTS,
     SINGLEFILE_DIST_DIR,
 )
 from app.services import (
     RANGE_YEARS,
     get_indicator_series_payload,
     get_indicators_payload,
+    get_instruments_payload,
     get_snapshot_payload,
 )
 from app.store import ValuationStore
@@ -28,14 +30,11 @@ from app.store import ValuationStore
 SNAPSHOT_PLACEHOLDER = "<!--VALUATION_SNAPSHOT_INJECT-->"
 
 
-def build_static_snapshot_bundle(
+def _build_series_for_instrument(
     store: ValuationStore,
-    instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
-) -> dict[str, Any]:
-    """Build the complete JSON data bundle using the same functions as the REST API."""
-    indicators = get_indicators_payload()
-    snapshot = get_snapshot_payload(store, instrument_symbol=instrument_symbol)
-
+    indicators: list[dict[str, Any]],
+    instrument_symbol: str,
+) -> dict[str, dict[str, Any]]:
     series_map: dict[str, dict[str, Any]] = {}
     for ind in indicators:
         if not ind.get("display", {}).get("chartable", True):
@@ -49,14 +48,41 @@ def build_static_snapshot_bundle(
                 instrument_symbol=instrument_symbol,
                 range_key=range_key,
             )
+    return series_map
+
+
+def build_static_snapshot_bundle(
+    store: ValuationStore,
+    instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
+) -> dict[str, Any]:
+    """Build the complete JSON data bundle using the same functions as the REST API."""
+    indicators = get_indicators_payload()
+    instruments = get_instruments_payload(store)
+    primary_symbol = instrument_symbol.upper()
+    snapshot = get_snapshot_payload(store, instrument_symbol=primary_symbol)
+    series_map = _build_series_for_instrument(store, indicators, primary_symbol)
+
+    snapshots_by_instrument: dict[str, Any] = {primary_symbol: snapshot}
+    series_by_instrument: dict[str, dict[str, dict[str, Any]]] = {primary_symbol: series_map}
+
+    for sym in INSTRUMENTS:
+        if sym == primary_symbol:
+            continue
+        if store.get_instrument(sym) is None:
+            continue
+        snapshots_by_instrument[sym] = get_snapshot_payload(store, instrument_symbol=sym)
+        series_by_instrument[sym] = _build_series_for_instrument(store, indicators, sym)
 
     return {
         "mode": "static",
-        "instrument": instrument_symbol.upper(),
+        "instrument": primary_symbol,
+        "instruments": instruments,
         "generated_at": snapshot["generated_at"],
         "indicators": indicators,
         "snapshot": snapshot,
         "series": series_map,
+        "snapshots": snapshots_by_instrument,
+        "series_by_instrument": series_by_instrument,
     }
 
 

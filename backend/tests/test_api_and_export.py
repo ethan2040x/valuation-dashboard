@@ -13,6 +13,7 @@ from app.api import create_app
 from app.export import build_static_snapshot_bundle, export_static_html
 from app.jobs import run_csv_import, run_daily_refresh
 from app.sources.base import FundamentalItem, FundamentalsSource, HoldingItem, HoldingsSource
+from app.sources.spy_holdings import parse_ishares_csv, parse_slickcharts_sp500_html
 from app.store import ValuationStore
 
 
@@ -156,3 +157,84 @@ def test_static_export_matches_api_payload_and_embeds_json(tmp_path):
     assert embedded["snapshot"]["indicators"]["pe_ttm"]["latest"]["value"] == (
         api_snapshot["indicators"]["pe_ttm"]["latest"]["value"]
     )
+
+
+def test_spy_instrument_api_and_multi_instrument_static_export(tmp_path):
+    """Verify SPY REST API endpoints and multi-instrument static snapshot bundle."""
+    db_path = tmp_path / "multi.db"
+    ndx_csv = tmp_path / "ndx.csv"
+    spy_csv = tmp_path / "spy.csv"
+    _create_sample_csv(ndx_csv, num_days=300)
+    _create_sample_csv(spy_csv, num_days=300)
+
+    store = ValuationStore(db_path)
+    run_csv_import(store, ndx_csv, instrument_symbol="NDX", source="seed_csv")
+    run_csv_import(store, spy_csv, instrument_symbol="SPY", source="seed_csv")
+
+    app = create_app(db_path=db_path, enable_scheduler=False, auto_seed=False, frontend_dist_dir=None)
+    client = TestClient(app)
+
+    instruments = client.get("/api/instruments").json()
+    symbols = [inst["symbol"] for inst in instruments]
+    assert "NDX" in symbols
+    assert "SPY" in symbols
+
+    spy_snap = client.get("/api/snapshot?instrument=SPY").json()
+    assert spy_snap["instrument"]["symbol"] == "SPY"
+    assert spy_snap["indicators"]["pe_ttm"]["latest"]["value"] is not None
+    assert spy_snap["indicators"]["pe_fwd"]["latest"]["value"] is not None
+
+    spy_series = client.get("/api/indicators/pe_ttm/series?instrument=SPY&range=5y").json()
+    assert spy_series["instrument"] == "SPY"
+    assert len(spy_series["series"]) == 300
+
+    bundle = build_static_snapshot_bundle(store, instrument_symbol="NDX")
+    assert [inst["symbol"] for inst in bundle["instruments"]] == symbols
+    assert "NDX" in bundle["snapshots"] and "SPY" in bundle["snapshots"]
+    assert "NDX" in bundle["series_by_instrument"] and "SPY" in bundle["series_by_instrument"]
+    assert bundle["snapshots"]["SPY"]["indicators"]["pe_ttm"]["latest"]["value"] == (
+        spy_snap["indicators"]["pe_ttm"]["latest"]["value"]
+    )
+    assert bundle["series_by_instrument"]["SPY"]["pe_ttm"]["5y"] == spy_series
+
+
+def test_spy_holdings_parsers():
+    """Verify Slickcharts S&P 500 HTML and iShares IVV CSV parsers."""
+    def _alpha_ticker(idx: int) -> str:
+        # Generate valid 4-letter tickers (AAAA..AAZZ) matching ^[A-Z]{1,5}([.-][A-Z])?$
+        a = chr(65 + (idx // 26) % 26)
+        b = chr(65 + idx % 26)
+        return f"SY{a}{b}"
+
+    # 1. Synthetic Slickcharts S&P 500 HTML table with 210 rows
+    rows_html = "\n".join(
+        f"<tr><td>{i}</td><td>Company {i}</td><td>{_alpha_ticker(i)}</td><td>{100.0 / 210:.4f}%</td></tr>"
+        for i in range(1, 211)
+    )
+    html = f"<html><body><table><tr><th>#</th><th>Company</th><th>Symbol</th><th>Weight</th></tr>{rows_html}</table></body></html>"
+    as_of_html, html_holdings = parse_slickcharts_sp500_html(html)
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", as_of_html)
+    assert len(html_holdings) == 210
+    assert abs(sum(h.weight for h in html_holdings) - 1.0) < 1e-9
+
+    # 2. Synthetic iShares IVV CSV with UTF-8 BOM, Fund Holdings as of, BRKB->BRK.B, and Cash row
+    csv_lines = [
+        '\ufeffiShares Core S&P 500 ETF',
+        'Fund Holdings as of,"Nov 20, 2026"',
+        'Inception Date,"May 15, 2000"',
+        'Ticker,Name,Sector,Asset Class,Market Value,Weight (%),Notional Value,Shares',
+        'BRKB,BERKSHIRE HATHAWAY INC CLASS B,Financials,Equity,1000,1.70,1000,10',
+        'XTSLA,BLK CSH FND TREASURY SL AGENCY,Cash and/or Derivatives,Money Market,10,0.05,10,10',
+        'USD,USD CASH,Cash and/or Derivatives,Cash,5,0.02,5,5',
+    ]
+    for i in range(1, 211):
+        csv_lines.append(f"{_alpha_ticker(i)},STOCK {i},Tech,Equity,100,{98.3 / 210:.4f},100,1")
+    as_of_csv, csv_holdings = parse_ishares_csv("\n".join(csv_lines))
+    assert as_of_csv == "2026-11-20"
+    tickers = {h.ticker for h in csv_holdings}
+    assert "BRK.B" in tickers
+    assert "BRKB" not in tickers
+    assert "XTSLA" not in tickers
+    assert "USD" not in tickers
+    assert len(csv_holdings) == 211
+    assert abs(sum(h.weight for h in csv_holdings) - 1.0) < 1e-9

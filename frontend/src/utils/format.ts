@@ -3,6 +3,7 @@ import type { DisplayConfig, ThresholdBand } from "../types/valuation";
 const SOURCE_LABELS: Record<string, string> = {
   computed: "成分股实时计算",
   "qqq+yfinance": "QQQ + yfinance",
+  "spy+yfinance": "SPY + yfinance",
   csv_import: "CSV 导入历史",
   seed_csv: "历史基准 CSV",
 };
@@ -10,6 +11,7 @@ const SOURCE_LABELS: Record<string, string> = {
 const JOB_LABELS: Record<string, string> = {
   daily_refresh: "每日定时/手动刷新",
   qqq_holdings: "QQQ 成分股权重",
+  spy_holdings: "SPY 成分股权重",
   yfinance: "yfinance 股价与 EPS",
   csv_import: "CSV 历史导入",
   compute_indicators: "指标计算引擎",

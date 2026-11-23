@@ -11,7 +11,7 @@ from typing import Any
 
 import pandas as pd
 
-from app.config import DEFAULT_INSTRUMENT_SYMBOL
+from app.config import DEFAULT_INSTRUMENT_SYMBOL, INSTRUMENTS
 from app.indicators import Indicator, discover_indicators, get_indicator, list_indicators
 from app.models import IndicatorPoint
 from app.store import ValuationStore, utc_now_iso
@@ -25,6 +25,25 @@ RANGE_YEARS: dict[str, int | None] = {
 
 # Approximate count of US market holidays per year (used to avoid false-positive missing-day alerts)
 US_MARKET_HOLIDAYS_PER_YEAR = 9
+
+
+def get_instruments_payload(store: ValuationStore) -> list[dict[str, Any]]:
+    """Return metadata for all available instruments."""
+    db_rows = {row["symbol"].upper(): row for row in store.list_instruments()}
+    result: list[dict[str, Any]] = []
+    for symbol, meta in INSTRUMENTS.items():
+        row = db_rows.get(symbol)
+        result.append(
+            {
+                "id": row["id"] if row else None,
+                "symbol": meta["symbol"],
+                "name": meta["name"],
+                "en_name": meta["en_name"],
+                "etf_ticker": meta["etf_ticker"],
+                "description": meta["description"],
+            }
+        )
+    return result
 
 
 def get_indicators_payload() -> list[dict[str, Any]]:

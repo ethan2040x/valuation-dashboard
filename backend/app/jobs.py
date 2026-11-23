@@ -14,6 +14,7 @@ from app.config import (
     DB_PATH,
     DEFAULT_INSTRUMENT_SYMBOL,
     EXPORT_OUTPUT_PATH,
+    INSTRUMENTS,
     SCHEDULE_CRON_HOUR,
     SCHEDULE_CRON_MINUTE,
     SCHEDULE_TIMEZONE,
@@ -24,10 +25,26 @@ from app.models import ConstituentQuote
 from app.sources.base import FundamentalsSource, HoldingsSource
 from app.sources.csv_import import import_csv_file
 from app.sources.qqq_holdings import QQQHoldingsSource
+from app.sources.spy_holdings import SPYHoldingsSource
 from app.sources.yfinance_source import YFinanceFundamentalsSource
 from app.store import ValuationStore
 
 logger = logging.getLogger(__name__)
+
+
+def get_holdings_source(instrument_symbol: str) -> HoldingsSource:
+    """Return the default HoldingsSource adapter for an instrument."""
+    symbol = instrument_symbol.upper()
+    if symbol == "SPY":
+        return SPYHoldingsSource()
+    return QQQHoldingsSource()
+
+
+def _source_tag_for_instrument(instrument_symbol: str) -> str:
+    meta = INSTRUMENTS.get(instrument_symbol.upper())
+    if meta and meta.get("source_tag"):
+        return meta["source_tag"]
+    return f"{instrument_symbol.lower()}+yfinance"
 
 
 def run_daily_refresh(
@@ -41,8 +58,9 @@ def run_daily_refresh(
     If either upstream data source fails, the failure is recorded in `job_runs` while all
     previously stored snapshots and indicator values remain intact.
     """
-    h_source = holdings_source or QQQHoldingsSource()
+    h_source = holdings_source or get_holdings_source(instrument_symbol)
     f_source = fundamentals_source or YFinanceFundamentalsSource()
+    source_tag = _source_tag_for_instrument(instrument_symbol)
 
     overall_job_id = store.start_job_run("daily_refresh", {"instrument": instrument_symbol})
     instrument = store.get_or_create_instrument(instrument_symbol)
@@ -92,7 +110,7 @@ def run_daily_refresh(
                         price=None,
                         eps_ttm=None,
                         eps_fwd=None,
-                        source="qqq+yfinance",
+                        source=source_tag,
                     )
                 )
             else:
@@ -107,7 +125,7 @@ def run_daily_refresh(
                         price=fund.price,
                         eps_ttm=fund.eps_ttm,
                         eps_fwd=fund.eps_fwd,
-                        source="qqq+yfinance",
+                        source=source_tag,
                     )
                 )
 
@@ -160,6 +178,7 @@ def run_daily_refresh(
         overall_job_id,
         status=overall_status,
         details={
+            "instrument": instrument_symbol,
             "as_of_date": as_of_date,
             "constituents_saved": saved_constituents,
             "ok_ttm": ok_ttm,
@@ -234,8 +253,9 @@ def bootstrap_seed_data_if_empty(
     seed_dir: Path = SEED_DIR,
     instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
 ) -> bool:
-    """Import seed CSVs from `data/seed/` if `raw_series` is currently empty."""
-    instrument = store.get_or_create_instrument(instrument_symbol)
+    """Import seed CSVs from `data/seed/` if `raw_series` is currently empty for an instrument."""
+    symbol_upper = instrument_symbol.upper()
+    instrument = store.get_or_create_instrument(symbol_upper)
     existing = store.get_raw_series(int(instrument["id"]), "pe_ttm")
     if existing:
         return False
@@ -243,44 +263,69 @@ def bootstrap_seed_data_if_empty(
     if not seed_dir.exists():
         return False
 
-    csv_files = sorted(p for p in seed_dir.glob("*.csv") if not p.name.startswith("qqq_holdings"))
+    meta = INSTRUMENTS.get(symbol_upper)
+    if meta and meta.get("seed_file"):
+        candidate = seed_dir / meta["seed_file"]
+        csv_files = [candidate] if candidate.exists() else []
+    else:
+        prefix = symbol_upper.lower()
+        csv_files = sorted(
+            p for p in seed_dir.glob(f"{prefix}*.csv") if not p.name.endswith("_holdings.csv")
+        )
+
     if not csv_files:
         return False
 
     imported_any = False
     for csv_file in csv_files:
-        logger.info("Bootstrapping seed CSV: %s", csv_file)
+        logger.info("Bootstrapping seed CSV for %s: %s", symbol_upper, csv_file)
         run_csv_import(
             store=store,
             csv_path=csv_file,
-            instrument_symbol=instrument_symbol,
+            instrument_symbol=symbol_upper,
             source="seed_csv",
             recompute=False,
         )
         imported_any = True
 
     if imported_any:
-        run_compute_indicators(store, instrument_symbol=instrument_symbol)
+        run_compute_indicators(store, instrument_symbol=symbol_upper)
     return imported_any
 
 
+def bootstrap_all_seed_data_if_empty(
+    store: ValuationStore,
+    seed_dir: Path = SEED_DIR,
+) -> dict[str, bool]:
+    """Bootstrap seed CSVs for all configured instruments that have empty data."""
+    return {
+        symbol: bootstrap_seed_data_if_empty(
+            store=store,
+            seed_dir=seed_dir,
+            instrument_symbol=symbol,
+        )
+        for symbol in INSTRUMENTS
+    }
+
+
 def create_scheduler(store: ValuationStore) -> BackgroundScheduler:
-    """Create APScheduler configured to refresh on US trading days after close."""
+    """Create APScheduler configured to refresh all instruments on US trading days after close."""
     scheduler = BackgroundScheduler(timezone=SCHEDULE_TIMEZONE)
-    scheduler.add_job(
-        func=run_daily_refresh,
-        kwargs={"store": store, "instrument_symbol": DEFAULT_INSTRUMENT_SYMBOL},
-        trigger=CronTrigger(
-            day_of_week="mon-fri",
-            hour=SCHEDULE_CRON_HOUR,
-            minute=SCHEDULE_CRON_MINUTE,
-            timezone=SCHEDULE_TIMEZONE,
-        ),
-        id="ndx_daily_refresh",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
+    for idx, symbol in enumerate(INSTRUMENTS):
+        scheduler.add_job(
+            func=run_daily_refresh,
+            kwargs={"store": store, "instrument_symbol": symbol},
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour=SCHEDULE_CRON_HOUR,
+                minute=(SCHEDULE_CRON_MINUTE + idx * 5) % 60,
+                timezone=SCHEDULE_TIMEZONE,
+            ),
+            id=f"{symbol.lower()}_daily_refresh",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     return scheduler
 
 
@@ -315,7 +360,10 @@ def _cli() -> None:
     store = ValuationStore(args.db)
 
     if args.command == "refresh":
-        res = run_daily_refresh(store, instrument_symbol=args.instrument)
+        if args.instrument.upper() == "ALL":
+            res = {sym: run_daily_refresh(store, instrument_symbol=sym) for sym in INSTRUMENTS}
+        else:
+            res = run_daily_refresh(store, instrument_symbol=args.instrument)
         print(res)
     elif args.command == "import-csv":
         res = run_csv_import(
@@ -326,10 +374,17 @@ def _cli() -> None:
         )
         print(res)
     elif args.command == "seed":
-        did_seed = bootstrap_seed_data_if_empty(store, instrument_symbol=args.instrument)
-        print({"seeded": did_seed})
+        if args.instrument.upper() == "ALL":
+            results = bootstrap_all_seed_data_if_empty(store)
+            print({"seeded": results})
+        else:
+            did_seed = bootstrap_seed_data_if_empty(store, instrument_symbol=args.instrument)
+            print({"seeded": did_seed})
     elif args.command == "compute":
-        res = run_compute_indicators(store, instrument_symbol=args.instrument)
+        if args.instrument.upper() == "ALL":
+            res = {sym: run_compute_indicators(store, instrument_symbol=sym) for sym in INSTRUMENTS}
+        else:
+            res = run_compute_indicators(store, instrument_symbol=args.instrument)
         print(res)
     elif args.command == "export":
         from app.export import export_static_html

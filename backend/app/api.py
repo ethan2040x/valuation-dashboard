@@ -20,7 +20,7 @@ from app.config import (
 )
 from app.indicators import discover_indicators
 from app.jobs import (
-    bootstrap_seed_data_if_empty,
+    bootstrap_all_seed_data_if_empty,
     create_scheduler,
     run_daily_refresh,
 )
@@ -28,6 +28,7 @@ from app.services import (
     RANGE_YEARS,
     get_indicator_series_payload,
     get_indicators_payload,
+    get_instruments_payload,
     get_snapshot_payload,
 )
 from app.store import ValuationStore
@@ -49,7 +50,7 @@ def create_app(
         discover_indicators()
         if auto_seed:
             try:
-                bootstrap_seed_data_if_empty(store)
+                bootstrap_all_seed_data_if_empty(store)
             except Exception as exc:
                 logger.warning("Auto-seed skipped due to error: %s", exc)
 
@@ -84,6 +85,11 @@ def create_app(
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/api/instruments")
+    def list_all_instruments() -> list[dict[str, Any]]:
+        """Return all configured instruments."""
+        return get_instruments_payload(app.state.store)
 
     @app.get("/api/indicators")
     def list_all_indicators() -> list[dict[str, Any]]:

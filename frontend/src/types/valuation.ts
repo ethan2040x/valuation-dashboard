@@ -137,18 +137,31 @@ export interface RefreshResult {
   indicators_computed: Record<string, number>;
 }
 
+export interface InstrumentMeta {
+  id?: number | null;
+  symbol: string;
+  name: string;
+  en_name: string;
+  etf_ticker: string;
+  description: string;
+}
+
 export interface StaticSnapshotBundle {
   mode: "static";
   instrument: string;
+  instruments?: InstrumentMeta[];
   generated_at: string;
   indicators: IndicatorMeta[];
   snapshot: SnapshotPayload;
   series: Record<string, Record<RangeKey, SeriesPayload>>;
+  snapshots?: Record<string, SnapshotPayload>;
+  series_by_instrument?: Record<string, Record<string, Record<RangeKey, SeriesPayload>>>;
 }
 
 export interface ValuationDataProvider {
   readonly mode: "dynamic" | "static";
   readonly snapshotGeneratedAt: string | null;
+  getInstruments(): Promise<InstrumentMeta[]>;
   getIndicators(): Promise<IndicatorMeta[]>;
   getSnapshot(instrument: string): Promise<SnapshotPayload>;
   getSeries(

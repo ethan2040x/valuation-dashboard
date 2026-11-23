@@ -77,6 +77,55 @@ body {
   color: var(--text-muted);
 }
 
+.topbar__right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.instrument-switcher {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--surface-alt, #eef2f7);
+  border: 1px solid var(--border, #e2e8f0);
+  gap: 2px;
+}
+
+.instrument-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  white-space: nowrap;
+}
+
+.instrument-tab:hover:not(.instrument-tab--active) {
+  color: var(--text);
+}
+
+.instrument-tab--active {
+  background: var(--surface, #fff);
+  color: var(--primary);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+
+.instrument-tab__sym {
+  font-size: 11px;
+  font-weight: 700;
+  opacity: 0.72;
+}
+
 .refresh-btn {
   display: inline-flex;
   align-items: center;

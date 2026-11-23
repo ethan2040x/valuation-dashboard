@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.config import DB_PATH, DEFAULT_INSTRUMENT_NAME, DEFAULT_INSTRUMENT_SYMBOL
+from app.config import DB_PATH, DEFAULT_INSTRUMENT_NAME, DEFAULT_INSTRUMENT_SYMBOL, INSTRUMENTS
 from app.models import ConstituentQuote, IndicatorPoint
 
 
@@ -118,14 +118,22 @@ class ValuationStore:
     def init_db(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA_SQL)
-            conn.execute(
-                "INSERT OR IGNORE INTO instruments (symbol, name) VALUES (?, ?)",
-                (DEFAULT_INSTRUMENT_SYMBOL, DEFAULT_INSTRUMENT_NAME),
-            )
+            for meta in INSTRUMENTS.values():
+                conn.execute(
+                    "INSERT OR IGNORE INTO instruments (symbol, name) VALUES (?, ?)",
+                    (meta["symbol"], meta["name"]),
+                )
 
     # ------------------------------------------------------------------
     # instruments
     # ------------------------------------------------------------------
+    def list_instruments(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, symbol, name FROM instruments ORDER BY id ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_or_create_instrument(self, symbol: str, name: str | None = None) -> dict[str, Any]:
         symbol_upper = symbol.upper()
         with self.connect() as conn:
@@ -135,7 +143,8 @@ class ValuationStore:
             ).fetchone()
             if row is not None:
                 return dict(row)
-            display_name = name or symbol_upper
+            default_meta = INSTRUMENTS.get(symbol_upper)
+            display_name = name or (default_meta["name"] if default_meta else symbol_upper)
             cur = conn.execute(
                 "INSERT INTO instruments (symbol, name) VALUES (?, ?)",
                 (symbol_upper, display_name),
