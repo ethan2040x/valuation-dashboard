@@ -8,7 +8,7 @@ interface FormulaExplainerProps {
 
 export const FormulaExplainer: React.FC<FormulaExplainerProps> = ({
   formula,
-  defaultOpen = true,
+  defaultOpen = false,
 }) => {
   const [open, setOpen] = useState(defaultOpen);
 

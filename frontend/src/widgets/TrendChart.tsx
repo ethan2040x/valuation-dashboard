@@ -278,7 +278,7 @@ export const TrendChart: React.FC<TrendChartProps> = ({
         </div>
       </div>
 
-      <FormulaExplainer formula={indicator.formula} defaultOpen={true} />
+      <FormulaExplainer formula={indicator.formula} defaultOpen={false} />
 
       {stats && stats.count > 0 && (
         <div className="chart-stats-bar">
