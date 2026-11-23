@@ -1,12 +1,15 @@
 import type { DisplayConfig, SourceTier, ThresholdBand } from "../types/valuation";
 
 const SOURCE_LABELS: Record<string, string> = {
-  computed: "成分股实时计算",
+  computed: "实时计算",
   "qqq+yfinance": "QQQ + yfinance",
   "spy+yfinance": "SPY + yfinance",
+  "equity+yfinance": "个股 yfinance 实时",
   siblis_free: "Siblis Research (免费)",
   multpl: "Multpl S&P 500 (免费)",
   shiller: "Shiller 历史库 (免费)",
+  sec_edgar: "SEC EDGAR 财报 (免费)",
+  yfinance_history: "Yahoo 财报历史 (免费)",
   csv_import: "CSV 导入历史",
   gurufocus_csv: "GuruFocus CSV",
   macromicro_csv: "MacroMicro CSV",
@@ -23,11 +26,15 @@ const JOB_LABELS: Record<string, string> = {
   yfinance: "yfinance 股价与 EPS",
   csv_import: "CSV 历史导入",
   compute_indicators: "指标计算引擎",
-  backfill_history: "20 年免费历史回填",
+  backfill_history: "免费历史回填",
   multpl: "Multpl 历史抓取",
   shiller: "Shiller 历史抓取",
   siblis_free: "Siblis 免费历史抓取",
   siblis_paid: "Siblis 付费历史抓取",
+  sec_edgar: "SEC EDGAR 财报抓取",
+  yfinance_history: "Yahoo 财报历史抓取",
+  refresh_equities: "自选公司批量刷新",
+  backfill_equities: "自选公司批量回填",
 };
 
 const TIER_LABELS: Record<SourceTier, string> = {
@@ -100,4 +107,40 @@ export function formatDateTime(iso: string | null | undefined): string {
   if (Number.isNaN(d.getTime())) return iso;
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+export function formatPrice(
+  value: number | null | undefined,
+  currency = "USD"
+): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return "—";
+  }
+  const prefix = currency === "USD" || !currency ? "$" : `${currency} `;
+  return `${prefix}${value.toFixed(2)}`;
+}
+
+export function formatMarketCap(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value) || value <= 0) {
+    return "—";
+  }
+  if (value >= 1e12) return `$${(value / 1e12).toFixed(2)}T`;
+  if (value >= 1e9) return `$${(value / 1e9).toFixed(0)}B`;
+  if (value >= 1e6) return `$${(value / 1e6).toFixed(0)}M`;
+  return `$${value.toFixed(0)}`;
+}
+
+export function resolvePercentileZone(
+  pct: number | null | undefined
+): ThresholdBand | null {
+  if (pct === null || pct === undefined || Number.isNaN(pct)) {
+    return null;
+  }
+  if (pct <= 30) {
+    return { label: "低估区间", color: "#16a34a", max: 30 };
+  }
+  if (pct <= 70) {
+    return { label: "适中区间", color: "#d97706", max: 70 };
+  }
+  return { label: "偏高区间", color: "#dc2626", max: null };
 }

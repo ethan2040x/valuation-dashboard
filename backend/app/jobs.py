@@ -6,9 +6,10 @@ import argparse
 import csv
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -22,15 +23,16 @@ from app.config import (
     SCHEDULE_CRON_MINUTE,
     SCHEDULE_TIMEZONE,
     SEED_DIR,
+    YFINANCE_MAX_WORKERS,
 )
 from app.engine import IndicatorEngine
-from app.models import ConstituentQuote
-from app.sources.base import FundamentalsSource, HoldingsSource
-from app.sources.csv_import import _normalize_date, import_csv_file
-from app.sources.history_sources import HistoricalSeriesSource, get_historical_sources
+from app.models import ConstituentQuote, EquitySnapshot
+from app.sources.base import FundamentalsSource, HistoricalSeriesSource, HoldingsSource
+from app.sources.csv_import import _normalize_date, import_csv_file, import_csv_text
+from app.sources.history_sources import get_historical_sources
 from app.sources.qqq_holdings import QQQHoldingsSource
 from app.sources.spy_holdings import SPYHoldingsSource
-from app.sources.yfinance_source import YFinanceFundamentalsSource
+from app.sources.yfinance_source import YFinanceFundamentalsSource, fetch_ticker_profile
 from app.store import ValuationStore
 
 logger = logging.getLogger(__name__)
@@ -51,18 +53,218 @@ def _source_tag_for_instrument(instrument_symbol: str) -> str:
     return f"{instrument_symbol.lower()}+yfinance"
 
 
+def _market_today_iso() -> str:
+    return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def run_equity_refresh(
+    store: ValuationStore,
+    symbols: list[str] | None = None,
+    fundamentals_source: FundamentalsSource | None = None,
+    reuse_constituents: bool = True,
+    as_of_date: str | None = None,
+    job_id: int | None = None,
+) -> dict[str, Any]:
+    """Batch-refresh US equity watchlist price, EPS, and indicators.
+
+    Reuses today's `constituent_snapshots` (from NDX/SPY) before calling yfinance,
+    limiting concurrency to avoid Yahoo rate limits.
+    """
+    if symbols is not None:
+        target_symbols = list(
+            dict.fromkeys(s.strip().upper() for s in symbols if s.strip())
+        )
+        for sym in target_symbols:
+            store.get_or_create_instrument(sym, kind="equity")
+    else:
+        target_symbols = [
+            row["symbol"] for row in store.list_instruments(kind="equity", enabled_only=True)
+        ]
+
+    single_sym = target_symbols[0] if len(target_symbols) == 1 else None
+    base_details: dict[str, Any] = (
+        {"instrument": single_sym} if single_sym else {"symbols": target_symbols}
+    )
+    eff_job_id = (
+        job_id
+        if job_id is not None
+        else store.start_job_run("refresh_equities", base_details)
+    )
+
+    if not target_symbols:
+        summary = {
+            **base_details,
+            "status": "success",
+            "as_of_date": as_of_date or _market_today_iso(),
+            "total": 0,
+            "saved": 0,
+            "reused": 0,
+            "fetched": 0,
+            "failed": [],
+            "indicators_computed": {},
+        }
+        store.finish_job_run(eff_job_id, status="success", details=summary)
+        return summary
+
+    eff_date = as_of_date or _market_today_iso()
+    reused_quotes: dict[str, ConstituentQuote] = {}
+    if reuse_constituents:
+        reused_quotes = store.get_constituent_quotes_for_date(eff_date, target_symbols)
+        if not reused_quotes and as_of_date is None:
+            local_today = date.today().isoformat()
+            if local_today != eff_date:
+                cand = store.get_constituent_quotes_for_date(local_today, target_symbols)
+                if cand:
+                    reused_quotes = cand
+                    eff_date = local_today
+
+    remaining = [
+        sym
+        for sym in target_symbols
+        if sym not in reused_quotes
+        or reused_quotes[sym].price is None
+        or (reused_quotes[sym].eps_ttm is None and reused_quotes[sym].eps_fwd is None)
+    ]
+
+    fetched_map: dict[str, Any] = {}
+    fetch_error: str | None = None
+    if remaining:
+        f_source = fundamentals_source or YFinanceFundamentalsSource(
+            max_workers=min(6, YFINANCE_MAX_WORKERS)
+        )
+        try:
+            fetched_map = f_source.fetch_fundamentals(remaining)
+        except Exception as exc:
+            fetch_error = str(exc)
+            logger.error("Batch equity fundamentals fetch failed: %s", fetch_error)
+
+    saved_count = 0
+    reused_count = 0
+    fetched_count = 0
+    failed_symbols: list[str] = []
+    computed_by_sym: dict[str, dict[str, int]] = {}
+
+    for idx, sym in enumerate(target_symbols):
+        inst = store.get_or_create_instrument(sym, kind="equity")
+        inst_id = int(inst["id"])
+        snap: EquitySnapshot | None = None
+
+        fund = fetched_map.get(sym)
+        if fund is not None and fund.price is not None and fund.price > 0:
+            snap = EquitySnapshot(
+                price=fund.price,
+                eps_ttm=fund.eps_ttm,
+                eps_fwd=fund.eps_fwd,
+                market_cap=fund.market_cap,
+                source="equity+yfinance",
+            )
+            fetched_count += 1
+            # Opportunistically enrich missing company metadata
+            update_fields: dict[str, Any] = {}
+            if not inst.get("en_name") and getattr(fund, "name", None):
+                update_fields["en_name"] = fund.name
+            if not inst.get("sector") and getattr(fund, "sector", None):
+                update_fields["sector"] = fund.sector
+            if not inst.get("currency") and getattr(fund, "currency", None):
+                update_fields["currency"] = fund.currency
+            if update_fields:
+                store.update_instrument(sym, **update_fields)
+        elif sym in reused_quotes:
+            rq = reused_quotes[sym]
+            snap = EquitySnapshot(
+                price=rq.price,
+                eps_ttm=rq.eps_ttm,
+                eps_fwd=rq.eps_fwd,
+                market_cap=None,
+                source="equity+yfinance",
+            )
+            reused_count += 1
+        else:
+            failed_symbols.append(sym)
+
+        if snap is not None:
+            store.save_equity_snapshot(inst_id, eff_date, snap)
+            saved_count += 1
+            computed_by_sym[sym] = run_compute_indicators(store, instrument_symbol=sym)
+
+        if job_id is not None:
+            store.update_job_run_details(
+                eff_job_id,
+                {
+                    **base_details,
+                    "completed": idx + 1,
+                    "total": len(target_symbols),
+                    "current_symbol": sym,
+                    "saved": saved_count,
+                    "reused": reused_count,
+                    "fetched": fetched_count,
+                    "failed": failed_symbols,
+                },
+            )
+
+    if saved_count == 0 and failed_symbols:
+        overall_status = "failed"
+    elif failed_symbols:
+        overall_status = "partial"
+    else:
+        overall_status = "success"
+
+    err_text = fetch_error or (
+        f"{len(failed_symbols)} tickers failed: {', '.join(failed_symbols[:10])}"
+        if failed_symbols
+        else None
+    )
+    summary = {
+        **base_details,
+        "job_id": eff_job_id,
+        "status": overall_status,
+        "error": err_text,
+        "as_of_date": eff_date,
+        "total": len(target_symbols),
+        "saved": saved_count,
+        "reused": reused_count,
+        "fetched": fetched_count,
+        "failed": failed_symbols,
+        "indicators_computed": (
+            computed_by_sym[single_sym] if single_sym and single_sym in computed_by_sym else computed_by_sym
+        ),
+    }
+    store.finish_job_run(eff_job_id, status=overall_status, error=err_text, details=summary)
+    return summary
+
+
 def run_daily_refresh(
     store: ValuationStore,
     instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
     holdings_source: HoldingsSource | None = None,
     fundamentals_source: FundamentalsSource | None = None,
 ) -> dict[str, Any]:
-    """Fetch daily QQQ holdings + yfinance price/EPS, persist snapshots, and recompute indicators.
+    """Fetch daily holdings + yfinance price/EPS for an index, or delegate equity refresh.
 
     If either upstream data source fails, the failure is recorded in `job_runs` while all
     previously stored snapshots and indicator values remain intact.
     """
-    symbol_upper = instrument_symbol.upper()
+    symbol_upper = instrument_symbol.strip().upper()
+    existing_inst = store.get_instrument(symbol_upper)
+    is_equity = (
+        (existing_inst is not None and existing_inst.get("kind") == "equity")
+        or (existing_inst is None and symbol_upper not in INSTRUMENTS)
+    )
+    if is_equity:
+        res = run_equity_refresh(
+            store,
+            symbols=[symbol_upper],
+            fundamentals_source=fundamentals_source,
+        )
+        return {
+            "status": res["status"],
+            "error": res.get("error"),
+            "as_of_date": res.get("as_of_date"),
+            "constituents_saved": res.get("saved", 0),
+            "equities_saved": res.get("saved", 0),
+            "indicators_computed": res.get("indicators_computed", {}),
+        }
+
     h_source = holdings_source or get_holdings_source(symbol_upper)
     f_source = fundamentals_source or YFinanceFundamentalsSource()
     source_tag = _source_tag_for_instrument(symbol_upper)
@@ -237,7 +439,27 @@ def run_csv_import(
     recompute: bool = True,
 ) -> dict[str, Any]:
     """Import historical CSV data into `raw_series` and optionally recompute indicators."""
-    symbol_upper = instrument_symbol.upper()
+    symbol_upper = instrument_symbol.strip().upper()
+    if symbol_upper == "AUTO":
+        csv_text = Path(csv_path).read_text(encoding="utf-8-sig")
+        res = run_csv_text_import(
+            store=store,
+            csv_text=csv_text,
+            instrument_symbol=None,
+            source=source,
+            series_id=series_id,
+            recompute=recompute,
+        )
+        totals: dict[str, int] = {}
+        for sym_counts in res["imported_by_symbol"].values():
+            for sid, cnt in sym_counts.items():
+                totals[sid] = totals.get(sid, 0) + cnt
+        return {
+            "imported": totals,
+            "imported_by_symbol": res["imported_by_symbol"],
+            "computed": res["computed_by_symbol"],
+        }
+
     job_id = store.start_job_run(
         "csv_import",
         {
@@ -270,6 +492,64 @@ def run_csv_import(
             },
         )
         return {"imported": counts, "computed": computed}
+    except Exception as exc:
+        store.finish_job_run(job_id, status="failed", error=str(exc))
+        raise
+
+
+def run_csv_text_import(
+    store: ValuationStore,
+    csv_text: str,
+    instrument_symbol: str | None = None,
+    source: str = "csv_import",
+    series_id: str | None = None,
+    recompute: bool = True,
+) -> dict[str, Any]:
+    """Import raw CSV text into `raw_series` (single or multi-company) and recompute."""
+    eff_inst = (
+        instrument_symbol.strip().upper()
+        if instrument_symbol and instrument_symbol.strip().upper() != "AUTO"
+        else None
+    )
+    job_id = store.start_job_run(
+        "csv_import",
+        {
+            "instrument": eff_inst,
+            "source": source,
+            "series_id": series_id,
+        },
+    )
+    try:
+        imported_by_symbol = import_csv_text(
+            store=store,
+            csv_text=csv_text,
+            instrument_symbol=eff_inst,
+            default_source=source,
+            series_id=series_id,
+        )
+        computed_by_symbol: dict[str, dict[str, int]] = {}
+        if recompute:
+            for sym in imported_by_symbol:
+                computed_by_symbol[sym] = run_compute_indicators(
+                    store, instrument_symbol=sym
+                )
+        affected = sorted(imported_by_symbol.keys())
+        details: dict[str, Any] = {
+            "imported_by_symbol": imported_by_symbol,
+            "computed_by_symbol": computed_by_symbol,
+            "symbols": affected,
+        }
+        if len(affected) == 1:
+            details["instrument"] = affected[0]
+        store.finish_job_run(job_id, status="success", details=details)
+        return {
+            "status": "success",
+            "imported_by_symbol": imported_by_symbol,
+            "computed_by_symbol": computed_by_symbol,
+            "total_rows": sum(
+                cnt for m in imported_by_symbol.values() for cnt in m.values()
+            ),
+        }
     except Exception as exc:
         store.finish_job_run(job_id, status="failed", error=str(exc))
         raise
@@ -439,6 +719,18 @@ def run_backfill_history(
     failed = 0
 
     for adapter in selected_adapters:
+        if (
+            sources is None
+            and adapter.source_id == "yfinance_history"
+            and source_results.get("sec_edgar", {}).get("saved", {}).get("pe_ttm", 0) > 0
+        ):
+            source_results["yfinance_history"] = {
+                "status": "skipped",
+                "saved": {},
+                "reason": "sec_edgar already populated pe_ttm",
+            }
+            continue
+
         src_job_id = store.start_job_run(
             adapter.source_id,
             {"instrument": symbol_upper, "start_date": start_date},
@@ -520,17 +812,116 @@ def run_backfill_history(
     return summary
 
 
+def run_backfill_equities(
+    store: ValuationStore,
+    symbols: list[str] | None = None,
+    years: int = 15,
+    include_paid: bool = False,
+    sources: list[str] | None = None,
+    job_id: int | None = None,
+) -> dict[str, Any]:
+    """Backfill historical P/E across enabled US equities via free adapters (SEC EDGAR -> Yahoo)."""
+    if symbols is not None:
+        target_symbols = list(
+            dict.fromkeys(s.strip().upper() for s in symbols if s.strip())
+        )
+        for sym in target_symbols:
+            store.get_or_create_instrument(sym, kind="equity")
+    else:
+        target_symbols = [
+            row["symbol"] for row in store.list_instruments(kind="equity", enabled_only=True)
+        ]
+
+    base_details: dict[str, Any] = {
+        "symbols": target_symbols,
+        "years": years,
+        "total": len(target_symbols),
+        "completed": 0,
+    }
+    eff_job_id = (
+        job_id
+        if job_id is not None
+        else store.start_job_run("backfill_equities", base_details)
+    )
+
+    results: dict[str, dict[str, Any]] = {}
+    total_saved = 0
+    succeeded = 0
+    failed = 0
+
+    for idx, sym in enumerate(target_symbols):
+        try:
+            res = run_backfill_history(
+                store,
+                instrument_symbol=sym,
+                years=years,
+                include_paid=include_paid,
+                sources=sources,
+            )
+            results[sym] = {
+                "status": res["status"],
+                "total_saved": res["total_saved"],
+            }
+            total_saved += int(res.get("total_saved", 0))
+            if res["status"] == "failed":
+                failed += 1
+            else:
+                succeeded += 1
+        except Exception as exc:
+            logger.warning("Equity backfill failed for %s: %s", sym, exc)
+            results[sym] = {"status": "failed", "total_saved": 0, "error": str(exc)}
+            failed += 1
+
+        store.update_job_run_details(
+            eff_job_id,
+            {
+                "symbols": target_symbols,
+                "years": years,
+                "total": len(target_symbols),
+                "completed": idx + 1,
+                "current_symbol": sym,
+                "succeeded": succeeded,
+                "failed": failed,
+                "total_saved": total_saved,
+                "results": results,
+            },
+        )
+
+    if failed > 0 and succeeded == 0 and total_saved == 0:
+        overall_status = "failed"
+    elif failed > 0:
+        overall_status = "partial"
+    else:
+        overall_status = "success"
+
+    summary = {
+        "job_id": eff_job_id,
+        "status": overall_status,
+        "symbols": target_symbols,
+        "years": years,
+        "total": len(target_symbols),
+        "completed": len(target_symbols),
+        "succeeded": succeeded,
+        "failed": failed,
+        "total_saved": total_saved,
+        "results": results,
+    }
+    store.finish_job_run(eff_job_id, status=overall_status, details=summary)
+    return summary
+
+
 def create_scheduler(store: ValuationStore) -> BackgroundScheduler:
-    """Create APScheduler configured to refresh all instruments on US trading days after close."""
+    """Create APScheduler configured to refresh indices and watchlist equities after US close."""
     scheduler = BackgroundScheduler(timezone=SCHEDULE_TIMEZONE)
     for idx, symbol in enumerate(INSTRUMENTS):
+        total_min = SCHEDULE_CRON_HOUR * 60 + SCHEDULE_CRON_MINUTE + idx * 5
         scheduler.add_job(
             func=run_daily_refresh,
             kwargs={"store": store, "instrument_symbol": symbol},
             trigger=CronTrigger(
                 day_of_week="mon-fri",
-                hour=SCHEDULE_CRON_HOUR,
-                minute=(SCHEDULE_CRON_MINUTE + idx * 5) % 60,
+                hour=(total_min // 60) % 24,
+                minute=total_min % 60,
                 timezone=SCHEDULE_TIMEZONE,
             ),
             id=f"{symbol.lower()}_daily_refresh",
@@ -538,6 +929,22 @@ def create_scheduler(store: ValuationStore) -> BackgroundScheduler:
             max_instances=1,
             coalesce=True,
         )
+
+    eq_total_min = SCHEDULE_CRON_HOUR * 60 + SCHEDULE_CRON_MINUTE + 15
+    scheduler.add_job(
+        func=run_equity_refresh,
+        kwargs={"store": store},
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=(eq_total_min // 60) % 24,
+            minute=eq_total_min % 60,
+            timezone=SCHEDULE_TIMEZONE,
+        ),
+        id="equities_daily_refresh",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     return scheduler
 
 
@@ -593,11 +1000,32 @@ def _cli() -> None:
 
     p_compute = sub.add_parser("compute", help="Recompute all registered indicators (backfill)")
     p_compute.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
-    p_compute.add_argument("--all", action="store_true", help="Compute all configured instruments")
+    p_compute.add_argument("--all", action="store_true", help="Compute all enabled instruments")
+
+    p_ref_eq = sub.add_parser("refresh-equities", help="Batch-refresh US equity watchlist")
+    p_ref_eq.add_argument("--symbols", default=None, help="Comma-separated equity tickers")
+
+    p_bf_eq = sub.add_parser("backfill-equities", help="Batch-backfill free history for US equity watchlist")
+    p_bf_eq.add_argument("--symbols", default=None, help="Comma-separated equity tickers")
+    p_bf_eq.add_argument("--years", type=int, default=15)
+
+    p_wl = sub.add_parser("watchlist", help="Manage US equity watchlist")
+    wl_sub = p_wl.add_subparsers(dest="watchlist_cmd", required=True)
+    wl_sub.add_parser("list", help="List watchlist equities")
+    wl_add = wl_sub.add_parser("add", help="Add a US equity to watchlist")
+    wl_add.add_argument("ticker", help="Ticker symbol (e.g. NVDA, AAPL)")
+    wl_add.add_argument("--name", default=None)
+    wl_add.add_argument("--sector", default=None)
+    wl_add.add_argument("--group", default=None)
+    wl_add.add_argument("--backfill", action="store_true", help="Run free backfill and refresh immediately")
+    wl_rm = wl_sub.add_parser("remove", help="Remove an equity from watchlist")
+    wl_rm.add_argument("ticker", help="Ticker symbol")
 
     p_export = sub.add_parser("export", help="Export single-file static HTML snapshot")
     p_export.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
     p_export.add_argument("--output", default=str(EXPORT_OUTPUT_PATH))
+    p_export.add_argument("--indices-only", action="store_true", help="Export index instruments only")
+    p_export.add_argument("--symbols", default=None, help="Comma-separated list of symbols to include")
 
     args = parser.parse_args()
     store = ValuationStore(args.db)
@@ -675,7 +1103,10 @@ def _cli() -> None:
         computed = (
             {}
             if args.no_recompute
-            else {sym: run_compute_indicators(store, instrument_symbol=sym) for sym in INSTRUMENTS}
+            else {
+                row["symbol"]: run_compute_indicators(store, instrument_symbol=row["symbol"])
+                for row in store.list_instruments(enabled_only=True)
+            }
         )
         print(
             json.dumps(
@@ -690,17 +1121,68 @@ def _cli() -> None:
         )
     elif args.command == "compute":
         if args.all or args.instrument.upper() == "ALL":
-            res = {sym: run_compute_indicators(store, instrument_symbol=sym) for sym in INSTRUMENTS}
+            targets = [row["symbol"] for row in store.list_instruments(enabled_only=True)]
+            res = {sym: run_compute_indicators(store, instrument_symbol=sym) for sym in targets}
         else:
             res = run_compute_indicators(store, instrument_symbol=args.instrument)
         print(res)
+    elif args.command == "refresh-equities":
+        sym_list = (
+            [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            if args.symbols
+            else None
+        )
+        print(json.dumps(run_equity_refresh(store, symbols=sym_list), ensure_ascii=False, indent=2))
+    elif args.command == "backfill-equities":
+        sym_list = (
+            [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            if args.symbols
+            else None
+        )
+        print(
+            json.dumps(
+                run_backfill_equities(store, symbols=sym_list, years=args.years),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "watchlist":
+        if args.watchlist_cmd == "list":
+            print(json.dumps(store.list_instruments(kind="equity"), ensure_ascii=False, indent=2))
+        elif args.watchlist_cmd == "add":
+            tk = args.ticker.strip().upper()
+            prof = fetch_ticker_profile(tk)
+            inst = store.upsert_instrument(
+                tk,
+                name=args.name or prof.get("en_name") or tk,
+                kind="equity",
+                en_name=prof.get("en_name", ""),
+                sector=args.sector or prof.get("sector", ""),
+                group_name=args.group or "",
+                currency=prof.get("currency", "USD"),
+            )
+            out: dict[str, Any] = {"instrument": inst}
+            if args.backfill:
+                out["backfill"] = run_backfill_history(store, instrument_symbol=tk, years=15)
+                out["refresh"] = run_equity_refresh(store, symbols=[tk])
+            print(json.dumps(out, ensure_ascii=False, indent=2))
+        elif args.watchlist_cmd == "remove":
+            removed = store.delete_instrument(args.ticker)
+            print(json.dumps({"removed": removed, "symbol": args.ticker.strip().upper()}))
     elif args.command == "export":
         from app.export import export_static_html
 
+        sym_list = (
+            [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            if args.symbols
+            else None
+        )
         out = export_static_html(
             store=store,
             instrument_symbol=args.instrument,
             output_path=Path(args.output),
+            include_equities=not args.indices_only,
+            symbols=sym_list,
         )
         print({"exported": str(out)})
 

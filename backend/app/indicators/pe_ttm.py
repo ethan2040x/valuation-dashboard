@@ -8,8 +8,7 @@ from app.indicators import register
 from app.indicators.base import (
     ComputeDeps,
     Indicator,
-    compute_weighted_pe,
-    merge_with_raw_series,
+    compute_base_pe_series,
 )
 from app.models import Display, FormulaInfo, IndicatorPoint, ReferenceLine, ThresholdBand
 
@@ -20,8 +19,7 @@ class PETTM(Indicator):
     name = "滚动 PE"
     unit = "x"
     description = (
-        "按目标指数 ETF（QQQ / SPY）成分股权重加权的过去 12 个月实际市盈率"
-        "（1 ÷ Σ 权重 × 个股滚动盈利收益率，亏损股计入）"
+        "指数按成分股权重调和加权的过去 12 个月实际市盈率；个股按最新股价 ÷ 过去 12 个月稀释 EPS 计算"
     )
     formula = FormulaInfo(
         expression="滚动 PE = 1 ÷ Σ (wᵢ × 滚动盈利收益率ᵢ)   ，其中 滚动盈利收益率ᵢ = 过去 12 个月实际 EPSᵢ ÷ 股价ᵢ",
@@ -42,9 +40,26 @@ class PETTM(Indicator):
             "缺数据成分股的权重合计超过 5% 时，当日数值标记为“不完整”",
         ),
     )
+    equity_formula = FormulaInfo(
+        expression="个股滚动 PE = 当日收盘价 ÷ 过去 12 个月滚动 EPS (TTM EPS)",
+        variables=(
+            ("当日收盘价", "最新市场价格或历史复权（仅拆股）收盘价"),
+            ("TTM EPS", "实时来自 yfinance trailingEps；历史序列由 SEC EDGAR 官方 10-Q/10-K 连续 4 季稀释 EPS（含拆股对齐）计算"),
+        ),
+        why=(
+            "单只公司的滚动 PE 直接反映市场当前愿意为过去 12 个月已实现每股盈利支付多少倍价格。"
+            "结合公司自身 5 年 / 10 年历史分位，可规避不同行业绝对估值中枢差异带来的误判。"
+        ),
+        rules=(
+            "公司处于亏损状态（TTM EPS ≤ 0）时标记为“亏损”，不展示无意义的负 PE",
+            "微利盈亏平衡期导致 PE > 300x 的极端毛刺会过滤并标注，防止拉扁多年走势图",
+            "支持通过 SEC EDGAR 自动回填 10–15 年历史（Yahoo 财报兜底 4–5 年）及外部 CSV 覆盖",
+        ),
+    )
     depends_on = []
     raw_series_ids = ["pe_ttm"]
     uses_constituents = True
+    uses_equity_snapshots = True
     params = {}
     display = Display(
         kind="metric_card",
@@ -65,22 +80,4 @@ class PETTM(Indicator):
     )
 
     def compute(self, deps: ComputeDeps, **params: Any) -> list[IndicatorPoint]:
-        computed_points: list[IndicatorPoint] = []
-        for date_str, quotes in sorted(deps.constituents.items()):
-            value, is_incomplete, meta = compute_weighted_pe(quotes, eps_field="eps_ttm")
-            if value is not None:
-                computed_points.append(
-                    IndicatorPoint(
-                        date=date_str,
-                        value=value,
-                        source="computed",
-                        is_incomplete=is_incomplete,
-                        meta=meta,
-                    )
-                )
-
-        return merge_with_raw_series(
-            computed_points=computed_points,
-            raw_rows=deps.raw_series("pe_ttm"),
-            source_priority=deps.source_priority,
-        )
+        return compute_base_pe_series(deps, series_id="pe_ttm", eps_field="eps_ttm")

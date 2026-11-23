@@ -8,8 +8,7 @@ from app.indicators import register
 from app.indicators.base import (
     ComputeDeps,
     Indicator,
-    compute_weighted_pe,
-    merge_with_raw_series,
+    compute_base_pe_series,
 )
 from app.models import Display, FormulaInfo, IndicatorPoint, ReferenceLine, ThresholdBand
 
@@ -20,8 +19,7 @@ class PEFwd(Indicator):
     name = "前瞻 PE"
     unit = "x"
     description = (
-        "按目标指数 ETF（QQQ / SPY）成分股权重加权的未来 12 个月一致预期市盈率"
-        "（1 ÷ Σ 权重 × 个股预期盈利收益率，亏损股计入）"
+        "指数按成分股权重调和加权的未来 12 个月一致预期市盈率；个股按最新股价 ÷ 未来 12 个月一致预期 EPS 计算"
     )
     formula = FormulaInfo(
         expression="前瞻 PE = 1 ÷ Σ (wᵢ × 预期盈利收益率ᵢ)   ，其中 预期盈利收益率ᵢ = 未来 12 个月一致预期 EPSᵢ ÷ 股价ᵢ",
@@ -42,9 +40,24 @@ class PEFwd(Indicator):
             "缺数据成分股的权重合计超过 5% 时，当日数值标记为“不完整”",
         ),
     )
+    equity_formula = FormulaInfo(
+        expression="个股前瞻 PE = 当日股价 ÷ 未来 12 个月一致预期 EPS (Forward EPS)",
+        variables=(
+            ("当日股价", "最新市场价格"),
+            ("Forward EPS", "分析师对公司未来 12 个月每股收益的一致预期（yfinance forwardEps）"),
+        ),
+        why=(
+            "资本市场交易的是未来预期。对于高成长或业绩反转公司，前瞻 PE 比滚动 PE 更能及时反映当前定价是否透支未来盈利。"
+        ),
+        rules=(
+            "预期亏损（Forward EPS ≤ 0）时标记为“亏损”",
+            "免费源普遍缺乏历史一致预期 EPS，系统每日自动积累前瞻 PE，也可通过 CSV 导入补充历史分位",
+        ),
+    )
     depends_on = []
     raw_series_ids = ["pe_fwd"]
     uses_constituents = True
+    uses_equity_snapshots = True
     params = {}
     display = Display(
         kind="metric_card",
@@ -65,22 +78,4 @@ class PEFwd(Indicator):
     )
 
     def compute(self, deps: ComputeDeps, **params: Any) -> list[IndicatorPoint]:
-        computed_points: list[IndicatorPoint] = []
-        for date_str, quotes in sorted(deps.constituents.items()):
-            value, is_incomplete, meta = compute_weighted_pe(quotes, eps_field="eps_fwd")
-            if value is not None:
-                computed_points.append(
-                    IndicatorPoint(
-                        date=date_str,
-                        value=value,
-                        source="computed",
-                        is_incomplete=is_incomplete,
-                        meta=meta,
-                    )
-                )
-
-        return merge_with_raw_series(
-            computed_points=computed_points,
-            raw_rows=deps.raw_series("pe_fwd"),
-            source_priority=deps.source_priority,
-        )
+        return compute_base_pe_series(deps, series_id="pe_fwd", eps_field="eps_fwd")

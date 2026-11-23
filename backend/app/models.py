@@ -94,6 +94,17 @@ class ConstituentQuote:
 
 
 @dataclass
+class EquitySnapshot:
+    """Single company daily price & EPS snapshot row."""
+
+    price: float | None = None
+    eps_ttm: float | None = None
+    eps_fwd: float | None = None
+    market_cap: float | None = None
+    source: str = "equity+yfinance"
+
+
+@dataclass
 class IndicatorPoint:
     """Single computed indicator value on a date."""
 

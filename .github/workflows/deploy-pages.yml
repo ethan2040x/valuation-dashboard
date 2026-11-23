@@ -65,6 +65,8 @@ jobs:
           python -m app.jobs backfill-history --all --years 20 || true
           python -m app.jobs refresh --instrument NDX
           python -m app.jobs refresh --instrument SPY || true
+          python -m app.jobs backfill-equities --years 15 || true
+          python -m app.jobs refresh-equities || true
           python -m app.jobs export --output _site/index.html
           cp _site/index.html _site/ndx-valuation-snapshot.html
           touch _site/.nojekyll

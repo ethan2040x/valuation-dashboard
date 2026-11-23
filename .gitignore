@@ -11,10 +11,11 @@ frontend/dist/
 frontend/dist-singlefile/
 _site/
 
-# Runtime SQLite database (keep seed CSVs)
+# Runtime SQLite database and SEC cache (keep seed CSVs)
 data/valuation.db
 data/valuation.db-shm
 data/valuation.db-wal
+data/sec_company_tickers.json
 
 # OS
 .DS_Store

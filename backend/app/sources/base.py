@@ -25,6 +25,10 @@ class FundamentalItem:
     eps_ttm: float | None
     eps_fwd: float | None
     error: str | None = None
+    market_cap: float | None = None
+    name: str | None = None
+    sector: str | None = None
+    currency: str | None = None
 
 
 class HoldingsSource(ABC):
@@ -45,6 +49,30 @@ class FundamentalsSource(ABC):
     @abstractmethod
     def fetch_fundamentals(self, tickers: list[str]) -> dict[str, FundamentalItem]:
         """Return mapping of ticker -> FundamentalItem."""
+
+
+class HistoricalSeriesSource(ABC):
+    """Adapter fetching historical index or equity P/E series into `raw_series`."""
+
+    source_id: str = "unknown"
+    tier: str = "free"
+    supported_instruments: tuple[str, ...] = ()
+    supported_series: tuple[str, ...] = ()
+
+    def is_configured(self) -> bool:
+        return True
+
+    def supports(self, instrument_symbol: str) -> bool:
+        return instrument_symbol.upper() in self.supported_instruments
+
+    @abstractmethod
+    def fetch_history(
+        self,
+        instrument_symbol: str,
+        start_date: str,
+        end_date: str | None = None,
+    ) -> dict[str, list[tuple[str, float]]]:
+        """Return `{series_id: [(date_iso, value), ...]}`."""
 
 
 def normalize_ticker_for_yahoo(ticker: str) -> str:

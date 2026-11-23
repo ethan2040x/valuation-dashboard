@@ -1,7 +1,7 @@
-# 纳指 100 估值看板 (Nasdaq 100 Valuation Dashboard)
+# 美股指数与自选公司估值看板 (Valuation Dashboard)
 
-基于 [DESIGN.md](./DESIGN.md) 实现的纳指 100 日频估值看板，包含：
-- **动态看板**：FastAPI + SQLite + APScheduler + React/TypeScript/ECharts，支持手动刷新与交易日定时更新。
+基于 [DESIGN.md](./DESIGN.md) 实现的日频估值看板，支持 **大盘指数（`NDX` / `SPY`）** 与 **美股自选公司（内置 Top 10 市值，支持扩展 10–50 家）** 双视图：
+- **动态看板**：FastAPI + SQLite + APScheduler + React/TypeScript/ECharts，支持手动/定时刷新、添加/删除自选公司与页面上传 CSV。
 - **离线静态页面**：同一套前端组件构建为单文件 HTML，内嵌快照 JSON，双击即可离线打开。
 - **声明式可扩展指标引擎**：新增指标只需在 `backend/app/indicators/` 新增一个指标定义文件，API 和前端零改动。
 
@@ -9,9 +9,15 @@
 
 | 指标 | ID | 口径与边界规则 |
 | --- | --- | --- |
-| 前瞻 PE | `pe_fwd` | `1 ÷ Σ(权重 × 未来12个月一致预期EPS ÷ 股价)`；亏损股计入；缺数据股剔除后权重归一；缺数据权重合计 > 5% 标记为“不完整” |
-| 滚动 PE | `pe_ttm` | 同上，EPS 为过去 12 个月实际 EPS；过滤异常正值脏数据（隐含 PE < 1x），保留全部亏损股 |
+| 前瞻 PE | `pe_fwd` | 指数按 `1 ÷ Σ(权重 × 未来12个月一致预期EPS ÷ 股价)`（亏损股计入；缺数据权重 > 5% 标“不完整”）；个股按 `股价 ÷ forwardEps` |
+| 滚动 PE | `pe_ttm` | 指数同上，采用过去 12 个月实际 EPS；个股按 `股价 ÷ TTM EPS`（亏损标“亏损”，> 300x 极端毛刺过滤） |
 | PE 历史分位 | `pe_percentile` | 窗口内 PE ≤ 当前值的交易日占比（5 年 / 10 年 / 20 年，对滚动 PE 和前瞻 PE 分别计算）；实际历史不足 1 年时不显示；超过 1 年但不满窗口时标注“基于 X 年数据” |
+
+## 视图与内置自选公司
+
+顶部固定 **`大盘指数`** 与 **`自选公司`** 两个主 Tab，避免公司数量增加导致导航膨胀：
+- **大盘指数**：跟踪纳指 100 (`NDX` / `QQQ`) 与标普 500 (`SPY`)。
+- **自选公司**：首次启动自动内置美股 Top 10 市值公司（`NVDA`、`AAPL`、`MSFT`、`AMZN`、`GOOGL`、`META`、`AVGO`、`TSLA`、`BRK.B`、`LLY`），提供搜索、行业筛选、分位排序、总览对比与下钻走势/分位详情，支持页面或 CLI 增删及批量 CSV 导入。
 
 ## 快速启动
 
@@ -54,18 +60,28 @@ backend/.venv/bin/python -m app.jobs backfill-history --all --years 20
 # 3. 拉取当日成分股权重 + yfinance 股价与 EPS，落库并重算全部指标
 backend/.venv/bin/python -m app.jobs refresh --all
 
-# 4. 导入自定义历史 CSV（支持宽表、长表、Siblis / Multpl / MacroMicro 双列表）
+# 4. 自选公司：免费回填 15 年 SEC EDGAR / Yahoo 历史与批量刷新最新行情
+backend/.venv/bin/python -m app.jobs backfill-equities --years 15
+backend/.venv/bin/python -m app.jobs refresh-equities
+
+# 5. 自选公司管理（增删查）
+backend/.venv/bin/python -m app.jobs watchlist list
+backend/.venv/bin/python -m app.jobs watchlist add AMD --name "超威半导体" --sector "半导体" --backfill
+backend/.venv/bin/python -m app.jobs watchlist remove AMD
+
+# 6. 导入自定义历史 CSV（支持宽表、长表、双列表及带 ticker 列的多公司批量 CSV）
 backend/.venv/bin/python -m app.jobs import-csv path/to/history.csv --source gurufocus_csv
 backend/.venv/bin/python -m app.jobs import-csv path/to/two_col.csv --source macromicro_csv --series-id pe_fwd
+backend/.venv/bin/python -m app.jobs import-csv path/to/equities.csv --instrument AUTO --source gurufocus_csv
 
-# 5. 查看 / 切换数据源优先级（默认 free_first，支持 external_first 或自定义）
+# 7. 查看 / 切换数据源优先级（默认 free_first，支持 external_first 或自定义）
 backend/.venv/bin/python -m app.jobs sources --instrument NDX
 backend/.venv/bin/python -m app.jobs set-priority --profile external_first
 
-# 6. 重算 / 回填全部已注册指标
+# 8. 重算 / 回填全部已注册指标
 backend/.venv/bin/python -m app.jobs compute --all
 
-# 7. 构建单文件前端模板并导出离线静态页面
+# 9. 构建单文件前端模板并导出离线静态页面
 npm run --prefix frontend build:static
 backend/.venv/bin/python -m app.jobs export --output dist/ndx-valuation-snapshot.html
 ```
@@ -135,18 +151,24 @@ backend/.venv/bin/pytest backend/tests -v
 
 看板支持 **实时计算源、免费公开历史源、外部导入 CSV 与可选付费 API**，同日存在多来源时按优先级自动合并，默认配置为 **`free_first`（免费源优先）**：
 
-1. **实时免费计算**：`computed`（`qqq+yfinance` / `spy+yfinance`，基于 Invesco / Slickcharts / iShares 成分股权重与 `yfinance` 股价/EPS）。
+1. **实时免费计算**：`computed`（指数：`qqq+yfinance` / `spy+yfinance`；个股：`equity+yfinance`，优先复用当日指数成分股快照）。
 2. **免费公开历史源**：
    - `siblis_free`：Siblis Research 免密钥公开历史接口（支持 `NDX`）。
    - `multpl`：Multpl S&P 500 百年月频 PE 表（结合 `^GSPC` 收盘价展开为日频，离线时按 NYSE 交易日历线性插值）。
    - `shiller`：Robert Shiller 公开数据集（`SP500 / Earnings`，作为 Multpl 备源）。
-3. **外部 CSV 导入源**：`csv_import`、`gurufocus_csv`、`macromicro_csv`、`bloomberg_csv`、`wind_csv`（通过 `import-csv` 导入；在 `free_first` 下位于免费历史源之后用于补充缺口，切换为 `external_first` 时优先生效）。
+   - `sec_edgar`：SEC EDGAR 官方 CompanyFacts XBRL（`10-Q`/`10-K` 稀释 EPS + 历史拆股对齐 + Yahoo 日收盘价，支持美股 10–15 年滚动 PE）。
+   - `yfinance_history`：Yahoo Finance 季度/年度利润表 EPS 历史（约 4–5 年免费兜底）。
+3. **外部 CSV 导入源**：`csv_import`、`gurufocus_csv`、`macromicro_csv`、`bloomberg_csv`、`wind_csv`（支持页面弹窗上传或 `import-csv` 导入，含 `--instrument AUTO` 多公司批量导入）。
 4. **可选付费 API**：`siblis_paid`（默认关闭，仅当设置 `SIBLIS_API_KEY` 且显式传 `--include-paid` / `include_paid=true` 时启用）。
 5. **内置 20 年基准种子**：`seed_csv`（`data/seed/ndx_pe_history.csv` 与 `data/seed/spy_pe_history.csv`，覆盖 `2006-01-03` 至今约 20 年 NYSE 交易日，零网络兜底）。
 
 ### 相关 REST API
 
+- `GET /api/instruments` / `POST /api/instruments` / `PATCH /api/instruments/{symbol}` / `DELETE /api/instruments/{symbol}`：管理大盘指数与美股自选公司
+- `GET /api/watchlist/overview?kind=equity`：单次聚合自选公司最新价、PE、5Y/10Y 分位与历史跨度
 - `GET /api/indicators/{id}/series?instrument=NDX&range=20y`（支持 `1y` / `5y` / `10y` / `20y` / `all`）
 - `GET /api/sources?instrument=NDX`：查看数据源目录、优先级顺序与当前数据库覆盖区间
 - `PUT /api/sources/priority`：切换优先级预设（`free_first` / `external_first`）或提交自定义顺序并自动重算指标
-- `POST /api/jobs/backfill-history?instrument=NDX&years=20&include_paid=false`：拉取免费 20 年历史数据
+- `POST /api/jobs/backfill-history?instrument=NDX&years=20&include_paid=false`：拉取单个标的免费历史数据
+- `POST /api/jobs/refresh-equities` & `POST /api/jobs/backfill-equities`：批量刷新 / 15 年回填自选公司（含 `GET /api/jobs/{job_id}` 进度查询）
+- `POST /api/import/csv`：导入单公司或带 `ticker` 列的多公司批量 CSV

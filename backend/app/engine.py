@@ -88,11 +88,19 @@ class IndicatorEngine:
 
         instrument = self.store.get_or_create_instrument(instrument_symbol)
         instrument_id = int(instrument["id"])
+        instrument_kind = instrument.get("kind", "index")
 
-        # Load constituent snapshots once if any indicator needs them
+        # Load constituent or equity snapshots once if any indicator needs them
         constituents = (
             self.store.get_constituent_snapshots(instrument_id)
-            if any(ind.uses_constituents for ind in ordered)
+            if instrument_kind == "index"
+            and any(ind.uses_constituents for ind in ordered)
+            else {}
+        )
+        equity_snapshots = (
+            self.store.get_equity_snapshots(instrument_id)
+            if instrument_kind == "equity"
+            and any(ind.uses_equity_snapshots for ind in ordered)
             else {}
         )
 
@@ -111,7 +119,9 @@ class IndicatorEngine:
         for ind in ordered:
             deps = ComputeDeps(
                 computed_cache,
+                instrument_kind=instrument_kind,
                 constituents=constituents,
+                equity_snapshots=equity_snapshots,
                 raw_series_map=raw_series_map,
                 source_priority=self.source_priority,
             )

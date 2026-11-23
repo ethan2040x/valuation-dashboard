@@ -62,13 +62,41 @@ def _extract_fundamental(ticker: str, info: dict[str, Any]) -> FundamentalItem:
 
     eps_ttm = _sanitize_eps(ticker, "eps_ttm", eps_ttm, price)
     eps_fwd = _sanitize_eps(ticker, "eps_fwd", eps_fwd, price)
+    market_cap = parse_float(info.get("marketCap"))
+    raw_name = info.get("shortName") or info.get("longName")
+    raw_sector = info.get("sector")
+    raw_currency = info.get("currency")
 
     return FundamentalItem(
         ticker=ticker,
         price=price,
         eps_ttm=eps_ttm,
         eps_fwd=eps_fwd,
+        market_cap=market_cap,
+        name=str(raw_name).strip() if raw_name else None,
+        sector=str(raw_sector).strip() if raw_sector else None,
+        currency=str(raw_currency).strip().upper() if raw_currency else None,
     )
+
+
+def fetch_ticker_profile(ticker: str) -> dict[str, Any]:
+    """Look up basic metadata (en_name, sector, currency) for a ticker via yfinance."""
+    yf_symbol = normalize_ticker_for_yahoo(ticker)
+    try:
+        info = yf.Ticker(yf_symbol).info or {}
+        if not info:
+            return {}
+        en_name = info.get("shortName") or info.get("longName")
+        sector = info.get("sector")
+        currency = info.get("currency")
+        return {
+            "en_name": str(en_name).strip() if en_name else "",
+            "sector": str(sector).strip() if sector else "",
+            "currency": str(currency).strip().upper() if currency else "USD",
+        }
+    except Exception as exc:
+        logger.debug("fetch_ticker_profile failed for %s: %s", ticker, exc)
+        return {}
 
 
 def _fetch_single_ticker(ticker: str) -> FundamentalItem:

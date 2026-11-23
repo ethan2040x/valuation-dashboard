@@ -4,6 +4,7 @@ import {
   formatDelta,
   formatSourceLabel,
   formatValue,
+  resolvePercentileZone,
   resolveThreshold,
 } from "../utils/format";
 
@@ -11,6 +12,7 @@ interface IndicatorCardRowProps {
   indicators: IndicatorMeta[];
   snapshot: SnapshotPayload;
   selectedIndicatorId: string;
+  instrumentKind?: "index" | "equity";
   onSelectIndicator: (indicatorId: string) => void;
   onFocusPercentile?: () => void;
 }
@@ -19,10 +21,12 @@ export const IndicatorCardRow: React.FC<IndicatorCardRowProps> = ({
   indicators,
   snapshot,
   selectedIndicatorId,
+  instrumentKind = "index",
   onSelectIndicator,
   onFocusPercentile,
 }) => {
   const visibleIndicators = indicators.filter((ind) => ind.display.card_visible !== false);
+  const pctVariants = snapshot.indicators["pe_percentile"]?.variants ?? [];
 
   return (
     <section className="card-row" aria-label="核心估值指标">
@@ -31,7 +35,32 @@ export const IndicatorCardRow: React.FC<IndicatorCardRowProps> = ({
         const latest = entry?.latest;
         const isChartable = ind.display.chartable;
         const isSelected = isChartable && selectedIndicatorId === ind.id;
-        const threshold = resolveThreshold(latest?.value, ind.display.thresholds);
+
+        const isNegativeEps = Boolean(latest?.meta?.negative_eps);
+        const isExtremePe = Boolean(latest?.meta?.extreme_pe);
+        const rawExtremePe =
+          typeof latest?.meta?.raw_pe === "number" ? latest.meta.raw_pe : null;
+        const isInsufficient = Boolean(latest?.meta?.insufficient_history);
+
+        let threshold = resolveThreshold(latest?.value, ind.display.thresholds);
+        if (
+          instrumentKind === "equity" &&
+          ind.display.kind === "metric_card" &&
+          (ind.id === "pe_ttm" || ind.id === "pe_fwd")
+        ) {
+          if (isNegativeEps || isExtremePe) {
+            threshold = null;
+          } else {
+            const pct5 = pctVariants.find(
+              (v) => v.params.base === ind.id && v.params.window_years === 5 && v.value !== null
+            );
+            const pct10 = pctVariants.find(
+              (v) => v.params.base === ind.id && v.params.window_years === 10 && v.value !== null
+            );
+            threshold = resolvePercentileZone(pct5?.value ?? pct10?.value ?? null);
+          }
+        }
+
         const deltaClass =
           latest?.delta === null || latest?.delta === undefined
             ? "delta-neutral"
@@ -41,7 +70,6 @@ export const IndicatorCardRow: React.FC<IndicatorCardRowProps> = ({
                 ? "delta-down"
                 : "delta-neutral";
 
-        const isInsufficient = Boolean(latest?.meta?.insufficient_history);
         const partialNote =
           typeof latest?.meta?.note === "string" && !isInsufficient
             ? latest.meta.note
@@ -95,7 +123,25 @@ export const IndicatorCardRow: React.FC<IndicatorCardRowProps> = ({
                     不完整
                   </span>
                 )}
-                {threshold && latest?.value !== null && latest?.value !== undefined && (
+                {isNegativeEps && (
+                  <span className="badge badge--muted" title="最新一期每股收益 ≤ 0">
+                    亏损
+                  </span>
+                )}
+                {isExtremePe && (
+                  <span
+                    className="badge badge--warning"
+                    title={
+                      rawExtremePe !== null
+                        ? `隐含市盈率约 ${rawExtremePe.toFixed(1)}x（超过 300x 阈值，未计入分位与均值）`
+                        : "PE > 300x 极端值"
+                    }
+                  >
+                    极端高估
+                  </span>
+                )}
+                {threshold &&
+                  (latest?.value !== null && latest?.value !== undefined) && (
                   <span
                     className="badge badge--zone"
                     style={{
@@ -113,6 +159,15 @@ export const IndicatorCardRow: React.FC<IndicatorCardRowProps> = ({
             <div className="metric-card__body">
               {isInsufficient ? (
                 <div className="metric-card__insufficient">历史不足 1 年</div>
+              ) : isNegativeEps ? (
+                <div className="metric-card__insufficient">亏损 (EPS ≤ 0)</div>
+              ) : isExtremePe ? (
+                <div
+                  className="metric-card__value"
+                  title={rawExtremePe !== null ? `原始值 ${rawExtremePe.toFixed(1)}x` : undefined}
+                >
+                  &gt;300x
+                </div>
               ) : (
                 <div className="metric-card__value">
                   {formatValue(latest?.value, ind.display)}
@@ -122,7 +177,13 @@ export const IndicatorCardRow: React.FC<IndicatorCardRowProps> = ({
               <div className={`metric-card__delta ${deltaClass}`}>
                 {isInsufficient
                   ? "积累满 1 年后自动显示"
-                  : formatDelta(latest?.delta, latest?.delta_pct, ind.display)}
+                  : isNegativeEps
+                    ? "公司当前净亏损，PE 不具可比性"
+                    : isExtremePe
+                      ? rawExtremePe !== null
+                        ? `微利期隐含 PE ≈ ${rawExtremePe.toFixed(1)}x`
+                        : "微利期极端值"
+                      : formatDelta(latest?.delta, latest?.delta_pct, ind.display)}
               </div>
             </div>
 

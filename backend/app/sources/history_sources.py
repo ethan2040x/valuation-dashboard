@@ -17,17 +17,17 @@ import io
 import logging
 import re
 import statistics
-from abc import ABC, abstractmethod
 from bisect import bisect_left
 from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
+import pandas as pd
 import yfinance as yf
 from bs4 import BeautifulSoup
 
-from app.config import HTTP_TIMEOUT_SECONDS, INSTRUMENTS, SIBLIS_API_KEY
-from app.sources.base import parse_float
+from app.config import HTTP_TIMEOUT_SECONDS, INSTRUMENTS, MAX_EQUITY_PE, SIBLIS_API_KEY
+from app.sources.base import HistoricalSeriesSource, normalize_ticker_for_yahoo, parse_float
 from app.sources.qqq_holdings import DEFAULT_HEADERS
 
 logger = logging.getLogger(__name__)
@@ -485,30 +485,6 @@ def expand_anchors_to_daily(
     return result
 
 
-class HistoricalSeriesSource(ABC):
-    """Adapter fetching historical index-level P/E series into `raw_series`."""
-
-    source_id: str = "unknown"
-    tier: str = "free"
-    supported_instruments: tuple[str, ...] = ()
-    supported_series: tuple[str, ...] = ()
-
-    def is_configured(self) -> bool:
-        return True
-
-    def supports(self, instrument_symbol: str) -> bool:
-        return instrument_symbol.upper() in self.supported_instruments
-
-    @abstractmethod
-    def fetch_history(
-        self,
-        instrument_symbol: str,
-        start_date: str,
-        end_date: str | None = None,
-    ) -> dict[str, list[tuple[str, float]]]:
-        """Return `{series_id: [(date_iso, value), ...]}`."""
-
-
 class MultplSP500Source(HistoricalSeriesSource):
     """Free Multpl S&P 500 monthly trailing P/E expanded to daily frequency."""
 
@@ -745,17 +721,130 @@ class SiblisHistoricalSource(HistoricalSeriesSource):
         return output
 
 
+def _extract_eps_row(df: Any) -> list[tuple[str, float]]:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    row_lookup = {str(idx).strip().lower(): idx for idx in df.index}
+    target_idx = row_lookup.get("diluted eps") or row_lookup.get("basic eps")
+    if target_idx is None:
+        return []
+
+    series = df.loc[target_idx]
+    if isinstance(series, pd.DataFrame):
+        series = series.iloc[0]
+
+    points: dict[str, float] = {}
+    for col, raw_val in series.items():
+        val = parse_float(raw_val)
+        if val is None:
+            continue
+        if hasattr(col, "date"):
+            dt_str = col.date().isoformat()
+        else:
+            dt_str = _parse_flexible_date(str(col)[:10]) or ""
+        if dt_str:
+            points[dt_str] = val
+
+    return sorted(points.items(), key=lambda item: item[0])
+
+
+def extract_ttm_eps_from_yfinance_frames(
+    quarterly_df: Any,
+    annual_df: Any = None,
+) -> list[tuple[str, float]]:
+    """Extract sorted `[(avail_date_iso, ttm_eps)]` anchors from yfinance income statements."""
+    q_points = _extract_eps_row(quarterly_df)
+    a_points = _extract_eps_row(annual_df)
+
+    anchors_by_date: dict[str, float] = {}
+    earliest_q_avail: str | None = None
+
+    if len(q_points) >= 4:
+        for i in range(3, len(q_points)):
+            start_d = date.fromisoformat(q_points[i - 3][0])
+            end_d = date.fromisoformat(q_points[i][0])
+            if 240 <= (end_d - start_d).days <= 320:
+                ttm_val = round(sum(v for _, v in q_points[i - 3 : i + 1]), 6)
+                av = (end_d + timedelta(days=45)).isoformat()
+                anchors_by_date[av] = ttm_val
+                if earliest_q_avail is None or av < earliest_q_avail:
+                    earliest_q_avail = av
+
+    for end_str, ann_val in a_points:
+        end_d = date.fromisoformat(end_str)
+        av = (end_d + timedelta(days=45)).isoformat()
+        if earliest_q_avail is None or av < earliest_q_avail:
+            anchors_by_date[av] = round(ann_val, 6)
+
+    return sorted(anchors_by_date.items(), key=lambda item: item[0])
+
+
+class YFinanceEquityHistorySource(HistoricalSeriesSource):
+    """Free Yahoo Finance income-statement historical TTM P/E fallback (~4-5 years)."""
+
+    source_id = "yfinance_history"
+    tier = "free"
+    supported_instruments = ()
+    supported_series = ("pe_ttm",)
+
+    def supports(self, instrument_symbol: str) -> bool:
+        return instrument_symbol.strip().upper() not in INSTRUMENTS
+
+    def fetch_history(
+        self,
+        instrument_symbol: str,
+        start_date: str,
+        end_date: str | None = None,
+    ) -> dict[str, list[tuple[str, float]]]:
+        from app.sources.sec_edgar import (
+            build_daily_pe_from_eps_anchors,
+            fetch_yahoo_equity_prices_and_splits,
+        )
+
+        sym = instrument_symbol.strip().upper()
+        if not self.supports(sym):
+            return {}
+
+        yf_symbol = normalize_ticker_for_yahoo(sym)
+        ticker_obj = yf.Ticker(yf_symbol)
+        q_df = getattr(ticker_obj, "quarterly_income_stmt", None)
+        a_df = getattr(ticker_obj, "income_stmt", None)
+        anchors = extract_ttm_eps_from_yfinance_frames(q_df, a_df)
+        if not anchors:
+            return {}
+
+        pre_start = (date.fromisoformat(start_date) - timedelta(days=120)).isoformat()
+        closes, _, _ = fetch_yahoo_equity_prices_and_splits(
+            sym, start_date=pre_start, end_date=end_date
+        )
+        if not closes:
+            return {}
+
+        daily_pe = build_daily_pe_from_eps_anchors(
+            anchors,
+            closes=closes,
+            start_date=start_date,
+            end_date=end_date,
+            max_pe=MAX_EQUITY_PE,
+        )
+        return {"pe_ttm": daily_pe} if daily_pe else {}
+
+
 def get_historical_sources(
     instrument_symbol: str,
     include_paid: bool = False,
     source_ids: list[str] | None = None,
 ) -> list[HistoricalSeriesSource]:
     """Return configured historical adapters for an instrument (defaults to free-only)."""
+    from app.sources.sec_edgar import SECEdgarEquitySource
+
     sym = instrument_symbol.upper()
     candidates: list[HistoricalSeriesSource] = [
         SiblisHistoricalSource(paid=False),
         MultplSP500Source(),
         ShillerSP500Source(),
+        SECEdgarEquitySource(),
+        YFinanceEquityHistorySource(),
         SiblisHistoricalSource(paid=True),
     ]
     requested = {s.strip() for s in source_ids} if source_ids else None

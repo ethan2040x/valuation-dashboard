@@ -35,20 +35,29 @@ RANGE_YEARS: dict[str, int | None] = {
 US_MARKET_HOLIDAYS_PER_YEAR = 9
 
 
-def get_instruments_payload(store: ValuationStore) -> list[dict[str, Any]]:
-    """Return metadata for all available instruments."""
-    db_rows = {row["symbol"].upper(): row for row in store.list_instruments()}
+def get_instruments_payload(
+    store: ValuationStore,
+    kind: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return metadata for all enabled instruments (optionally filtered by kind)."""
+    rows = store.list_instruments(kind=kind, enabled_only=True)
     result: list[dict[str, Any]] = []
-    for symbol, meta in INSTRUMENTS.items():
-        row = db_rows.get(symbol)
+    for row in rows:
+        sym = str(row["symbol"]).upper()
+        meta = INSTRUMENTS.get(sym, {})
         result.append(
             {
-                "id": row["id"] if row else None,
-                "symbol": meta["symbol"],
-                "name": meta["name"],
-                "en_name": meta["en_name"],
-                "etf_ticker": meta["etf_ticker"],
-                "description": meta["description"],
+                "id": row["id"],
+                "symbol": sym,
+                "name": row.get("name") or meta.get("name") or sym,
+                "en_name": row.get("en_name") or meta.get("en_name") or sym,
+                "kind": row.get("kind") or meta.get("kind") or "index",
+                "sector": row.get("sector") or "",
+                "group_name": row.get("group_name") or "",
+                "currency": row.get("currency") or meta.get("currency") or "USD",
+                "etf_ticker": row.get("etf_ticker") or meta.get("etf_ticker") or "",
+                "description": row.get("description") or meta.get("description") or "",
+                "enabled": bool(row.get("enabled", True)),
             }
         )
     return result
@@ -180,8 +189,9 @@ def _build_indicator_snapshot_entry(
     """Build latest value + daily delta for one indicator + param set.
 
     Guarantees we return the latest non-null value when available (so upstream failures
-    never wipe the displayed number to null or 0). For percentile indicators with
-    insufficient history (< 1 year), returns the latest metadata explaining why it is hidden.
+    never wipe the displayed number to null or 0). However, if the newest point is an
+    explicit valuation sentinel (`negative_eps` or `extreme_pe`), surfaces that state
+    instead of masking current losses with old profitable P/E values.
     """
     latest_valid = store.get_latest_indicator_points(
         instrument_id=instrument_id,
@@ -190,15 +200,35 @@ def _build_indicator_snapshot_entry(
         limit=2,
         include_null=False,
     )
+    latest_any = store.get_latest_indicator_points(
+        instrument_id=instrument_id,
+        indicator_id=indicator.id,
+        params=params,
+        limit=1,
+        include_null=True,
+    )
+
+    if latest_any and latest_any[0].value is None:
+        sentinel = latest_any[0]
+        is_sentinel = bool(
+            sentinel.meta.get("negative_eps") or sentinel.meta.get("extreme_pe")
+        )
+        if is_sentinel and (not latest_valid or sentinel.date >= latest_valid[0].date):
+            prev = latest_valid[0] if latest_valid else None
+            return {
+                "params": params,
+                "date": sentinel.date,
+                "value": None,
+                "prev_date": prev.date if prev else None,
+                "prev_value": prev.value if prev else None,
+                "delta": None,
+                "delta_pct": None,
+                "source": sentinel.source,
+                "is_incomplete": sentinel.is_incomplete,
+                "meta": sentinel.meta,
+            }
 
     if not latest_valid:
-        latest_any = store.get_latest_indicator_points(
-            instrument_id=instrument_id,
-            indicator_id=indicator.id,
-            params=params,
-            limit=1,
-            include_null=True,
-        )
         pt = latest_any[0] if latest_any else None
         return {
             "params": params,
@@ -246,9 +276,10 @@ def get_snapshot_payload(
     if instrument is None:
         raise KeyError(f"Unknown instrument: {instrument_symbol}")
     instrument_id = int(instrument["id"])
+    inst_kind = instrument.get("kind", "index")
 
     indicators_data: dict[str, Any] = {}
-    reference_dates: list[str] = []
+    reference_dates_set: set[str] = set()
 
     for ind in list_indicators():
         combos = ind.param_combinations()
@@ -261,9 +292,8 @@ def get_snapshot_payload(
                 "latest": entry,
                 "variants": [entry],
             }
-            if not reference_dates:
-                pts = store.get_indicator_values(instrument_id, ind.id, {})
-                reference_dates = [pt.date for pt in pts if pt.value is not None]
+            pts = store.get_indicator_values(instrument_id, ind.id, {})
+            reference_dates_set.update(pt.date for pt in pts if pt.value is not None)
         else:
             variants = [
                 _build_indicator_snapshot_entry(store, instrument_id, ind, combo)
@@ -282,6 +312,7 @@ def get_snapshot_payload(
                 "variants": variants,
             }
 
+    reference_dates = sorted(reference_dates_set)
     job_runs = store.get_latest_job_runs(instrument_symbol=instrument["symbol"])
     last_updated_at = None
     for j in job_runs:
@@ -291,10 +322,16 @@ def get_snapshot_payload(
 
     missing_days = _estimate_missing_trading_days(reference_dates)
     latest_data_date = reference_dates[-1] if reference_dates else None
+    latest_quote = (
+        store.get_latest_equity_snapshot(instrument_id)
+        if inst_kind == "equity"
+        else None
+    )
 
     return {
         "instrument": instrument,
         "generated_at": utc_now_iso(),
+        "latest_quote": latest_quote,
         "indicators": indicators_data,
         "status": {
             "last_updated_at": last_updated_at,
@@ -303,6 +340,103 @@ def get_snapshot_payload(
             "total_trading_days": len(reference_dates),
             "jobs": job_runs,
         },
+    }
+
+
+def get_watchlist_overview_payload(
+    store: ValuationStore,
+    kind: str = "equity",
+) -> dict[str, Any]:
+    """Return compact overview rows across all enabled instruments of `kind`."""
+    discover_indicators()
+    pe_ttm_ind = get_indicator("pe_ttm")
+    pe_fwd_ind = get_indicator("pe_fwd")
+    pct_ind = get_indicator("pe_percentile")
+
+    instruments = get_instruments_payload(store, kind=kind)
+    items: list[dict[str, Any]] = []
+
+    for inst in instruments:
+        inst_id = int(inst["id"])
+        latest_quote = store.get_latest_equity_snapshot(inst_id) if kind == "equity" else None
+
+        pe_ttm_entry = (
+            _build_indicator_snapshot_entry(store, inst_id, pe_ttm_ind, {})
+            if pe_ttm_ind is not None
+            else None
+        )
+        pe_fwd_entry = (
+            _build_indicator_snapshot_entry(store, inst_id, pe_fwd_ind, {})
+            if pe_fwd_ind is not None
+            else None
+        )
+
+        pct_ttm_5y = (
+            _build_indicator_snapshot_entry(
+                store, inst_id, pct_ind, {"base": "pe_ttm", "window_years": 5}
+            )
+            if pct_ind is not None
+            else None
+        )
+        pct_ttm_10y = (
+            _build_indicator_snapshot_entry(
+                store, inst_id, pct_ind, {"base": "pe_ttm", "window_years": 10}
+            )
+            if pct_ind is not None
+            else None
+        )
+        pct_fwd_5y = (
+            _build_indicator_snapshot_entry(
+                store, inst_id, pct_ind, {"base": "pe_fwd", "window_years": 5}
+            )
+            if pct_ind is not None
+            else None
+        )
+        pct_fwd_10y = (
+            _build_indicator_snapshot_entry(
+                store, inst_id, pct_ind, {"base": "pe_fwd", "window_years": 10}
+            )
+            if pct_ind is not None
+            else None
+        )
+
+        cov = store.get_indicator_coverage_summary(inst_id)
+        history_years: float | None = None
+        if cov.get("min_date") and cov.get("max_date"):
+            span_days = (
+                date.fromisoformat(cov["max_date"]) - date.fromisoformat(cov["min_date"])
+            ).days
+            history_years = round(span_days / 365.25, 1)
+
+        items.append(
+            {
+                "instrument": inst,
+                "price": latest_quote["price"] if latest_quote else None,
+                "price_date": latest_quote["date"] if latest_quote else None,
+                "market_cap": latest_quote["market_cap"] if latest_quote else None,
+                "eps_ttm": latest_quote["eps_ttm"] if latest_quote else None,
+                "eps_fwd": latest_quote["eps_fwd"] if latest_quote else None,
+                "pe_ttm": pe_ttm_entry,
+                "pe_fwd": pe_fwd_entry,
+                "percentiles": {
+                    "pe_ttm_5y": pct_ttm_5y,
+                    "pe_ttm_10y": pct_ttm_10y,
+                    "pe_fwd_5y": pct_fwd_5y,
+                    "pe_fwd_10y": pct_fwd_10y,
+                },
+                "history_start": cov.get("min_date"),
+                "history_end": cov.get("max_date"),
+                "history_days": cov.get("count", 0),
+                "history_years": history_years,
+                "sources": cov.get("sources", []),
+            }
+        )
+
+    return {
+        "kind": kind,
+        "generated_at": utc_now_iso(),
+        "count": len(items),
+        "items": items,
     }
 
 
@@ -315,19 +449,28 @@ def get_sources_payload(
     if instrument is None:
         raise KeyError(f"Unknown instrument: {instrument_symbol}")
 
+    inst_kind = instrument.get("kind", "index")
     profile, priority = store.get_source_priority()
     coverage_map = store.get_source_coverage(int(instrument["id"]))
 
     ordered_ids = list(
         dict.fromkeys([*priority, *DATA_SOURCES.keys(), *coverage_map.keys()])
     )
+    filtered_ids = [
+        sid
+        for sid in ordered_ids
+        if sid in coverage_map
+        or (DATA_SOURCES.get(sid, {}).get("applies_to", "all") in ("all", inst_kind))
+    ]
+
     sources_list: list[dict[str, Any]] = []
-    for idx, sid in enumerate(ordered_ids):
+    for idx, sid in enumerate(filtered_ids):
         meta = DATA_SOURCES.get(sid) or {
             "id": sid,
             "name": sid,
             "tier": "external_csv",
             "kind": "csv",
+            "applies_to": "all",
             "default_enabled": True,
             "requires_env": None,
             "description": "自定义导入来源",
@@ -348,6 +491,7 @@ def get_sources_payload(
                 "name": meta["name"],
                 "tier": meta["tier"],
                 "kind": meta["kind"],
+                "applies_to": meta.get("applies_to", "all"),
                 "default_enabled": bool(meta.get("default_enabled", True)),
                 "requires_env": req_env,
                 "configured": configured,

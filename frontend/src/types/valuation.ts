@@ -49,6 +49,7 @@ export interface IndicatorMeta {
   params: Record<string, Array<string | number>>;
   display: DisplayConfig;
   formula?: FormulaInfo | null;
+  equity_formula?: FormulaInfo | null;
 }
 
 export interface SeriesPoint {
@@ -56,7 +57,7 @@ export interface SeriesPoint {
   value: number | null;
   source: string;
   is_incomplete: boolean;
-  meta: Record<string, unknown>;
+  meta?: Record<string, unknown>;
 }
 
 export interface SeriesStats {
@@ -114,13 +115,31 @@ export interface JobRunStatus {
   last_success_at: string | null;
 }
 
+export interface EquityQuoteSummary {
+  date: string;
+  price: number | null;
+  eps_ttm: number | null;
+  eps_fwd: number | null;
+  market_cap: number | null;
+  source: string;
+  fetched_at: string;
+}
+
 export interface SnapshotPayload {
   instrument: {
     id: number;
     symbol: string;
     name: string;
+    kind?: "index" | "equity";
+    en_name?: string;
+    sector?: string;
+    group_name?: string;
+    currency?: string;
+    etf_ticker?: string;
+    description?: string;
   };
   generated_at: string;
+  latest_quote?: EquityQuoteSummary | null;
   indicators: Record<string, SnapshotIndicatorEntry>;
   status: {
     last_updated_at: string | null;
@@ -136,6 +155,7 @@ export interface RefreshResult {
   error: string | null;
   as_of_date: string | null;
   constituents_saved: number;
+  equities_saved?: number;
   indicators_computed: Record<string, number>;
 }
 
@@ -144,8 +164,86 @@ export interface InstrumentMeta {
   symbol: string;
   name: string;
   en_name: string;
+  kind: "index" | "equity";
+  sector?: string;
+  group_name?: string;
+  currency?: string;
   etf_ticker: string;
   description: string;
+  enabled?: boolean;
+}
+
+export interface WatchlistItem {
+  instrument: InstrumentMeta;
+  price: number | null;
+  price_date: string | null;
+  market_cap: number | null;
+  eps_ttm: number | null;
+  eps_fwd: number | null;
+  pe_ttm: SnapshotVariant | null;
+  pe_fwd: SnapshotVariant | null;
+  percentiles: {
+    pe_ttm_5y: SnapshotVariant | null;
+    pe_ttm_10y: SnapshotVariant | null;
+    pe_fwd_5y: SnapshotVariant | null;
+    pe_fwd_10y: SnapshotVariant | null;
+  };
+  history_start: string | null;
+  history_end: string | null;
+  history_days: number;
+  history_years: number | null;
+  sources: string[];
+}
+
+export interface WatchlistOverviewPayload {
+  kind: "index" | "equity";
+  generated_at: string;
+  count: number;
+  items: WatchlistItem[];
+}
+
+export interface AddCompaniesRequest {
+  symbol?: string;
+  symbols?: string[];
+  name?: string;
+  en_name?: string;
+  sector?: string;
+  group_name?: string;
+  currency?: string;
+  backfill?: boolean;
+  refresh?: boolean;
+}
+
+export interface AddCompaniesResponse {
+  instruments: InstrumentMeta[];
+  job_id: number | null;
+  status: string;
+  backfill?: Record<string, unknown> | null;
+  refresh?: Record<string, unknown> | null;
+}
+
+export interface CsvImportRequest {
+  csv_text: string;
+  instrument?: string | null;
+  source?: string;
+  series_id?: string | null;
+}
+
+export interface CsvImportResponse {
+  status: string;
+  imported_by_symbol: Record<string, Record<string, number>>;
+  computed_by_symbol: Record<string, Record<string, number>>;
+  total_rows: number;
+}
+
+export interface BatchJobPayload {
+  job_id?: number;
+  id?: number;
+  job?: string;
+  status: "running" | "success" | "partial" | "failed";
+  error?: string | null;
+  total?: number;
+  details?: Record<string, unknown>;
 }
 
 export interface SourceCoverageEntry {
@@ -215,12 +313,13 @@ export interface StaticSnapshotBundle {
     Record<string, Partial<Record<RangeKey, SeriesPayload>>>
   >;
   sources_by_instrument?: Record<string, SourcesPayload>;
+  watchlist_overview?: WatchlistOverviewPayload;
 }
 
 export interface ValuationDataProvider {
   readonly mode: "dynamic" | "static";
   readonly snapshotGeneratedAt: string | null;
-  getInstruments(): Promise<InstrumentMeta[]>;
+  getInstruments(kind?: "index" | "equity"): Promise<InstrumentMeta[]>;
   getIndicators(): Promise<IndicatorMeta[]>;
   getSnapshot(instrument: string): Promise<SnapshotPayload>;
   getSeries(
@@ -229,6 +328,7 @@ export interface ValuationDataProvider {
     range: RangeKey
   ): Promise<SeriesPayload>;
   getSources(instrument: string): Promise<SourcesPayload>;
+  getWatchlistOverview(kind?: "index" | "equity"): Promise<WatchlistOverviewPayload>;
   updateSourcePriority?(payload: {
     profile?: string;
     priority?: string[];
@@ -239,6 +339,19 @@ export interface ValuationDataProvider {
     instrument: string,
     years?: number
   ): Promise<BackfillResult>;
+  addInstruments?(payload: AddCompaniesRequest): Promise<AddCompaniesResponse>;
+  deleteInstrument?(symbol: string): Promise<{ removed: boolean; symbol: string }>;
+  importCsv?(payload: CsvImportRequest): Promise<CsvImportResponse>;
+  triggerRefreshEquities?(payload?: {
+    symbols?: string[];
+    async_run?: boolean;
+  }): Promise<BatchJobPayload>;
+  triggerBackfillEquities?(payload?: {
+    symbols?: string[];
+    years?: number;
+    async_run?: boolean;
+  }): Promise<BatchJobPayload>;
+  getJobStatus?(jobId: number): Promise<BatchJobPayload>;
 }
 
 declare global {

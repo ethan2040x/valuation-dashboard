@@ -8,28 +8,38 @@ from typing import Any, Literal
 
 import pandas as pd
 
-from app.config import INCOMPLETE_WEIGHT_THRESHOLD, SOURCE_PRIORITY
-from app.models import ConstituentQuote, Display, FormulaInfo, IndicatorPoint
+from app.config import INCOMPLETE_WEIGHT_THRESHOLD, MAX_EQUITY_PE, SOURCE_PRIORITY
+from app.models import (
+    ConstituentQuote,
+    Display,
+    EquitySnapshot,
+    FormulaInfo,
+    IndicatorPoint,
+)
 
 
 class ComputeDeps(dict[str, list[IndicatorPoint]]):
     """Dependency container passed to `Indicator.compute`.
 
     Behaves like a standard `dict[indicator_id, list[IndicatorPoint]]` for derived
-    indicators while also exposing raw constituent snapshots and raw series for base
-    indicators.
+    indicators while also exposing raw constituent snapshots, equity snapshots, and
+    raw series for base indicators.
     """
 
     def __init__(
         self,
         indicator_series: dict[str, list[IndicatorPoint]] | None = None,
         *,
+        instrument_kind: Literal["index", "equity"] = "index",
         constituents: dict[str, list[ConstituentQuote]] | None = None,
+        equity_snapshots: dict[str, list[EquitySnapshot]] | None = None,
         raw_series_map: dict[str, list[dict[str, Any]]] | None = None,
         source_priority: list[str] | None = None,
     ) -> None:
         super().__init__(indicator_series or {})
+        self.instrument_kind: Literal["index", "equity"] = instrument_kind
         self.constituents: dict[str, list[ConstituentQuote]] = constituents or {}
+        self.equity_snapshots: dict[str, list[EquitySnapshot]] = equity_snapshots or {}
         self._raw_series_map: dict[str, list[dict[str, Any]]] = raw_series_map or {}
         self.source_priority: list[str] = list(source_priority or SOURCE_PRIORITY)
 
@@ -47,9 +57,11 @@ class Indicator(ABC):
     depends_on: list[str] = []
     raw_series_ids: list[str] = []
     uses_constituents: bool = False
+    uses_equity_snapshots: bool = False
     params: dict[str, list[Any]] = {}
     display: Display = Display()
     formula: FormulaInfo | None = None
+    equity_formula: FormulaInfo | None = None
 
     @property
     def kind(self) -> Literal["base", "derived"]:
@@ -74,6 +86,9 @@ class Indicator(ABC):
             "params": {k: list(v) for k, v in self.params.items()},
             "display": self.display.to_dict(),
             "formula": self.formula.to_dict() if self.formula is not None else None,
+            "equity_formula": (
+                self.equity_formula.to_dict() if self.equity_formula is not None else None
+            ),
         }
 
     @abstractmethod
@@ -156,15 +171,127 @@ def compute_weighted_pe(
     return pe_value, is_incomplete, meta
 
 
+def compute_equity_pe(
+    date_str: str,
+    snapshots: list[EquitySnapshot],
+    eps_field: Literal["eps_ttm", "eps_fwd"],
+    source_priority: list[str] | None = None,
+    max_pe: float = MAX_EQUITY_PE,
+) -> IndicatorPoint | None:
+    """Compute single-stock P/E from equity snapshots on `date_str`.
+
+    - Selects the highest-priority snapshot with valid price (> 0) and non-null EPS.
+    - Loss-making (`eps <= 0`): returns `value=None` with `meta={"negative_eps": True}`.
+    - Extreme breakeven (`price / eps > max_pe`): returns `value=None` with `meta={"extreme_pe": True}`.
+    """
+    if not snapshots:
+        return None
+
+    priority = list(source_priority or SOURCE_PRIORITY)
+
+    def _rank(src: str) -> tuple[int, str]:
+        try:
+            return (priority.index(src), src)
+        except ValueError:
+            return (len(priority), src)
+
+    candidates = [
+        snap
+        for snap in snapshots
+        if snap.price is not None and snap.price > 0 and getattr(snap, eps_field) is not None
+    ]
+    if not candidates:
+        return None
+
+    chosen = min(candidates, key=lambda s: _rank(s.source))
+    price = float(chosen.price)  # type: ignore[arg-type]
+    eps = float(getattr(chosen, eps_field))
+    base_meta: dict[str, Any] = {
+        "price": round(price, 4),
+        "eps": round(eps, 6),
+        "snapshot_source": chosen.source,
+    }
+    if chosen.market_cap is not None:
+        base_meta["market_cap"] = chosen.market_cap
+
+    if eps <= 0:
+        base_meta["negative_eps"] = True
+        return IndicatorPoint(
+            date=date_str,
+            value=None,
+            source="computed",
+            is_incomplete=False,
+            meta=base_meta,
+        )
+
+    raw_pe = price / eps
+    if raw_pe > max_pe:
+        base_meta["extreme_pe"] = True
+        base_meta["raw_pe"] = round(raw_pe, 2)
+        return IndicatorPoint(
+            date=date_str,
+            value=None,
+            source="computed",
+            is_incomplete=False,
+            meta=base_meta,
+        )
+
+    return IndicatorPoint(
+        date=date_str,
+        value=round(raw_pe, 4),
+        source="computed",
+        is_incomplete=False,
+        meta=base_meta,
+    )
+
+
+def compute_base_pe_series(
+    deps: ComputeDeps,
+    series_id: Literal["pe_ttm", "pe_fwd"],
+    eps_field: Literal["eps_ttm", "eps_fwd"],
+) -> list[IndicatorPoint]:
+    """Compute index or equity P/E series from snapshots and merge with raw_series."""
+    computed_points: list[IndicatorPoint] = []
+    if deps.instrument_kind == "equity":
+        for date_str, snaps in sorted(deps.equity_snapshots.items()):
+            pt = compute_equity_pe(
+                date_str,
+                snaps,
+                eps_field=eps_field,
+                source_priority=deps.source_priority,
+            )
+            if pt is not None:
+                computed_points.append(pt)
+    else:
+        for date_str, quotes in sorted(deps.constituents.items()):
+            value, is_incomplete, meta = compute_weighted_pe(quotes, eps_field=eps_field)
+            if value is not None:
+                computed_points.append(
+                    IndicatorPoint(
+                        date=date_str,
+                        value=value,
+                        source="computed",
+                        is_incomplete=is_incomplete,
+                        meta=meta,
+                    )
+                )
+
+    return merge_with_raw_series(
+        computed_points=computed_points,
+        raw_rows=deps.raw_series(series_id),
+        source_priority=deps.source_priority,
+    )
+
+
 def merge_with_raw_series(
     computed_points: list[IndicatorPoint],
     raw_rows: list[dict[str, Any]],
     source_priority: list[str] | None = None,
 ) -> list[IndicatorPoint]:
-    """Merge computed constituent-based points with imported `raw_series` rows.
+    """Merge computed snapshot-based points with imported `raw_series` rows.
 
     When multiple sources exist on the same date, the highest-priority source wins.
-    Unknown sources rank after all explicitly configured priorities.
+    Preserves `value=None` sentinel points carrying `negative_eps` or `extreme_pe`.
     """
     priority = list(source_priority or SOURCE_PRIORITY)
 
@@ -192,7 +319,8 @@ def merge_with_raw_series(
 
     # Overlay computed points respecting priority
     for pt in computed_points:
-        if pt.value is None:
+        keep_sentinel = bool(pt.meta.get("negative_eps") or pt.meta.get("extreme_pe"))
+        if pt.value is None and not keep_sentinel:
             continue
         existing = by_date.get(pt.date)
         if existing is None or rank(pt.source) < rank(existing.source):

@@ -14,6 +14,7 @@ interface TrendChartProps {
   seriesPayload: SeriesPayload | null;
   range: RangeKey;
   loading: boolean;
+  instrumentKind?: "index" | "equity";
   onRangeChange: (range: RangeKey) => void;
 }
 
@@ -32,9 +33,12 @@ const SOURCE_STYLE: Record<
   computed: { color: "#2563eb", lineType: "solid", width: 2.5 },
   "qqq+yfinance": { color: "#2563eb", lineType: "solid", width: 2.5 },
   "spy+yfinance": { color: "#2563eb", lineType: "solid", width: 2.5 },
+  "equity+yfinance": { color: "#2563eb", lineType: "solid", width: 2.5 },
   siblis_free: { color: "#0284c7", lineType: "solid", width: 2 },
   multpl: { color: "#0891b2", lineType: "solid", width: 2 },
   shiller: { color: "#0d9488", lineType: "solid", width: 2 },
+  sec_edgar: { color: "#0284c7", lineType: "solid", width: 2 },
+  yfinance_history: { color: "#0891b2", lineType: "solid", width: 2 },
   csv_import: { color: "#0f766e", lineType: "dashed", width: 2 },
   gurufocus_csv: { color: "#7c3aed", lineType: "dashed", width: 2 },
   macromicro_csv: { color: "#9333ea", lineType: "dashed", width: 2 },
@@ -59,6 +63,7 @@ export const TrendChart: React.FC<TrendChartProps> = ({
   seriesPayload,
   range,
   loading,
+  instrumentKind = "index",
   onRangeChange,
 }) => {
   const chartRef = useRef<HTMLDivElement | null>(null);
@@ -288,7 +293,14 @@ export const TrendChart: React.FC<TrendChartProps> = ({
         </div>
       </div>
 
-      <FormulaExplainer formula={indicator.formula} defaultOpen={false} />
+      <FormulaExplainer
+        formula={
+          instrumentKind === "equity"
+            ? (indicator.equity_formula ?? indicator.formula)
+            : indicator.formula
+        }
+        defaultOpen={false}
+      />
 
       {stats && stats.count > 0 && (
         <div className="chart-stats-bar">

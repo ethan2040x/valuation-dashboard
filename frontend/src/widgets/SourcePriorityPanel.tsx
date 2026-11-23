@@ -7,6 +7,7 @@ interface SourcePriorityPanelProps {
   isStatic: boolean;
   busy: boolean;
   backfilling: boolean;
+  instrumentKind?: "index" | "equity";
   onApplyProfile?: (profileId: string) => void;
   onMovePriority?: (sourceId: string, direction: "up" | "down") => void;
   onBackfillFree?: () => void;
@@ -33,6 +34,7 @@ export const SourcePriorityPanel: React.FC<SourcePriorityPanelProps> = ({
   isStatic,
   busy,
   backfilling,
+  instrumentKind = "index",
   onApplyProfile,
   onMovePriority,
   onBackfillFree,
@@ -105,7 +107,13 @@ export const SourcePriorityPanel: React.FC<SourcePriorityPanelProps> = ({
                     disabled={busy || backfilling}
                     onClick={onBackfillFree}
                   >
-                    {backfilling ? "正在拉取免费 20 年历史…" : "拉取免费 20 年历史"}
+                    {backfilling
+                      ? instrumentKind === "equity"
+                        ? "正在拉取免费 15 年财报历史…"
+                        : "正在拉取免费 20 年历史…"
+                      : instrumentKind === "equity"
+                        ? "拉取免费 15 年财报历史"
+                        : "拉取免费 20 年历史"}
                   </button>
                 )}
               </>

@@ -1,5 +1,10 @@
 import type {
+  AddCompaniesRequest,
+  AddCompaniesResponse,
   BackfillResult,
+  BatchJobPayload,
+  CsvImportRequest,
+  CsvImportResponse,
   IndicatorMeta,
   InstrumentMeta,
   RangeKey,
@@ -10,6 +15,7 @@ import type {
   SourcesPayload,
   StaticSnapshotBundle,
   ValuationDataProvider,
+  WatchlistOverviewPayload,
 } from "../types/valuation";
 
 const FALLBACK_INSTRUMENTS: InstrumentMeta[] = [
@@ -17,6 +23,7 @@ const FALLBACK_INSTRUMENTS: InstrumentMeta[] = [
     symbol: "NDX",
     name: "纳指 100",
     en_name: "Nasdaq-100",
+    kind: "index",
     etf_ticker: "QQQ",
     description:
       "日频追踪纳指 100 (QQQ) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年 / 20 年历史估值分位",
@@ -25,6 +32,7 @@ const FALLBACK_INSTRUMENTS: InstrumentMeta[] = [
     symbol: "SPY",
     name: "标普 500",
     en_name: "S&P 500",
+    kind: "index",
     etf_ticker: "SPY",
     description:
       "日频追踪标普 500 (SPY) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年 / 20 年历史估值分位",
@@ -142,12 +150,14 @@ class ApiDataProvider implements ValuationDataProvider {
     return (await res.json()) as T;
   }
 
-  async getInstruments(): Promise<InstrumentMeta[]> {
+  async getInstruments(kind?: "index" | "equity"): Promise<InstrumentMeta[]> {
     try {
-      const list = await this.fetchJson<InstrumentMeta[]>("/api/instruments");
-      return list.length > 0 ? list : FALLBACK_INSTRUMENTS;
+      const qs = kind ? `?kind=${encodeURIComponent(kind)}` : "";
+      const list = await this.fetchJson<InstrumentMeta[]>(`/api/instruments${qs}`);
+      if (list.length > 0) return list;
+      return kind ? FALLBACK_INSTRUMENTS.filter((i) => i.kind === kind) : FALLBACK_INSTRUMENTS;
     } catch {
-      return FALLBACK_INSTRUMENTS;
+      return kind ? FALLBACK_INSTRUMENTS.filter((i) => i.kind === kind) : FALLBACK_INSTRUMENTS;
     }
   }
 
@@ -174,6 +184,14 @@ class ApiDataProvider implements ValuationDataProvider {
   getSources(instrument: string): Promise<SourcesPayload> {
     return this.fetchJson<SourcesPayload>(
       `/api/sources?instrument=${encodeURIComponent(instrument)}`
+    );
+  }
+
+  getWatchlistOverview(
+    kind: "index" | "equity" = "equity"
+  ): Promise<WatchlistOverviewPayload> {
+    return this.fetchJson<WatchlistOverviewPayload>(
+      `/api/watchlist/overview?kind=${encodeURIComponent(kind)}`
     );
   }
 
@@ -205,6 +223,58 @@ class ApiDataProvider implements ValuationDataProvider {
       { method: "POST" }
     );
   }
+
+  addInstruments(payload: AddCompaniesRequest): Promise<AddCompaniesResponse> {
+    return this.fetchJson<AddCompaniesResponse>("/api/instruments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  deleteInstrument(
+    symbol: string
+  ): Promise<{ removed: boolean; symbol: string }> {
+    return this.fetchJson<{ removed: boolean; symbol: string }>(
+      `/api/instruments/${encodeURIComponent(symbol)}`,
+      { method: "DELETE" }
+    );
+  }
+
+  importCsv(payload: CsvImportRequest): Promise<CsvImportResponse> {
+    return this.fetchJson<CsvImportResponse>("/api/import/csv", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  }
+
+  triggerRefreshEquities(payload?: {
+    symbols?: string[];
+    async_run?: boolean;
+  }): Promise<BatchJobPayload> {
+    return this.fetchJson<BatchJobPayload>("/api/jobs/refresh-equities", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload ?? { async_run: true }),
+    });
+  }
+
+  triggerBackfillEquities(payload?: {
+    symbols?: string[];
+    years?: number;
+    async_run?: boolean;
+  }): Promise<BatchJobPayload> {
+    return this.fetchJson<BatchJobPayload>("/api/jobs/backfill-equities", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload ?? { years: 15, async_run: true }),
+    });
+  }
+
+  getJobStatus(jobId: number): Promise<BatchJobPayload> {
+    return this.fetchJson<BatchJobPayload>(`/api/jobs/${encodeURIComponent(String(jobId))}`);
+  }
 }
 
 class SnapshotDataProvider implements ValuationDataProvider {
@@ -217,12 +287,18 @@ class SnapshotDataProvider implements ValuationDataProvider {
     this.snapshotGeneratedAt = bundle.generated_at;
   }
 
-  async getInstruments(): Promise<InstrumentMeta[]> {
-    if (this.bundle.instruments && this.bundle.instruments.length > 0) {
-      return this.bundle.instruments;
-    }
-    const sym = this.bundle.instrument.toUpperCase();
-    return FALLBACK_INSTRUMENTS.filter((i) => i.symbol === sym);
+  async getInstruments(kind?: "index" | "equity"): Promise<InstrumentMeta[]> {
+    const raw =
+      this.bundle.instruments && this.bundle.instruments.length > 0
+        ? this.bundle.instruments
+        : FALLBACK_INSTRUMENTS.filter(
+            (i) => i.symbol === this.bundle.instrument.toUpperCase()
+          );
+    const normalized = raw.map((inst) => ({
+      ...inst,
+      kind: inst.kind ?? "index",
+    }));
+    return kind ? normalized.filter((i) => i.kind === kind) : normalized;
   }
 
   async getIndicators(): Promise<IndicatorMeta[]> {
@@ -277,6 +353,20 @@ class SnapshotDataProvider implements ValuationDataProvider {
       priority: [],
       profiles: [],
       sources: [],
+    };
+  }
+
+  async getWatchlistOverview(
+    kind: "index" | "equity" = "equity"
+  ): Promise<WatchlistOverviewPayload> {
+    if (this.bundle.watchlist_overview && this.bundle.watchlist_overview.kind === kind) {
+      return this.bundle.watchlist_overview;
+    }
+    return {
+      kind,
+      generated_at: this.bundle.generated_at,
+      count: 0,
+      items: [],
     };
   }
 }
