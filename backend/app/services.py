@@ -282,7 +282,7 @@ def get_snapshot_payload(
                 "variants": variants,
             }
 
-    job_runs = store.get_latest_job_runs()
+    job_runs = store.get_latest_job_runs(instrument_symbol=instrument["symbol"])
     last_updated_at = None
     for j in job_runs:
         ts = j.get("last_success_at") or j.get("finished_at") or j.get("started_at")

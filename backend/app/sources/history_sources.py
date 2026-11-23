@@ -635,7 +635,7 @@ class ShillerSP500Source(HistoricalSeriesSource):
 class SiblisHistoricalSource(HistoricalSeriesSource):
     """Siblis Research historical P/E API (free tier by default, optional paid key)."""
 
-    supported_instruments = ("NDX", "SPY")
+    supported_instruments = ("NDX",)
     supported_series = ("pe_ttm", "pe_fwd")
 
     def __init__(

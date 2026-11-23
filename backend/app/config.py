@@ -53,7 +53,6 @@ INSTRUMENTS: dict[str, dict[str, str]] = {
         "en_name": "S&P 500",
         "etf_ticker": "SPY",
         "yahoo_index": "^GSPC",
-        "siblis_ticker": "SPX",
         "description": "日频追踪标普 500 (SPY) 权重加权前瞻 PE、滚动 PE 及 5 年 / 10 年 / 20 年历史估值分位",
         "source_tag": "spy+yfinance",
         "seed_file": "spy_pe_history.csv",
@@ -95,7 +94,7 @@ DATA_SOURCES: dict[str, dict[str, Any]] = {
         "kind": "history_api",
         "default_enabled": True,
         "requires_env": None,
-        "description": "Siblis Research 免密钥公开历史 PE 接口（支持 NDX 与 SPX）",
+        "description": "Siblis Research 免密钥公开历史 PE 接口（支持 NDX）",
     },
     "multpl": {
         "id": "multpl",

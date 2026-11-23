@@ -20,9 +20,12 @@ from app.jobs import (
     run_csv_import,
 )
 from app.models import ConstituentQuote, IndicatorPoint
+from app.services import get_snapshot_payload
 from app.sources.history_sources import (
     HistoricalSeriesSource,
+    SiblisHistoricalSource,
     expand_anchors_to_daily,
+    get_historical_sources,
     parse_multpl_pe_html,
     parse_shiller_csv,
     parse_siblis_csv,
@@ -470,3 +473,50 @@ def test_seed_upgrade_extends_10y_to_20y_without_losing_live_or_csv_data(tmp_pat
 
     # Second run is a no-op
     assert bootstrap_seed_data_if_empty(store, seed_dir=seed_dir, instrument_symbol="NDX") is False
+
+
+def test_siblis_limited_to_ndx_and_job_status_scoped_per_instrument(tmp_path):
+    # 1. Siblis adapter only supports NDX (not SPY)
+    assert SiblisHistoricalSource(paid=False).supports("NDX") is True
+    assert SiblisHistoricalSource(paid=False).supports("SPY") is False
+    assert [s.source_id for s in get_historical_sources("NDX")] == ["siblis_free"]
+    assert [s.source_id for s in get_historical_sources("SPY")] == ["multpl", "shiller"]
+
+    # 2. Per-instrument job isolation prevents NDX/SPY statuses from overwriting or leaking
+    store = ValuationStore(tmp_path / "job_scope.db")
+    ndx_id = int(store.get_or_create_instrument("NDX")["id"])
+    spy_id = int(store.get_or_create_instrument("SPY")["id"])
+    store.save_raw_series(ndx_id, "pe_ttm", [("2026-11-20", 25.0)], source="seed_csv")
+    store.save_raw_series(spy_id, "pe_ttm", [("2026-11-20", 24.0)], source="seed_csv")
+    run_compute_indicators(store, instrument_symbol="NDX")
+    run_compute_indicators(store, instrument_symbol="SPY")
+
+    # Record NDX jobs (success) and SPY jobs (including stale failed siblis_free for SPY)
+    j1 = store.start_job_run("siblis_free", {"instrument": "NDX"})
+    store.finish_job_run(j1, status="success", details={"instrument": "NDX"})
+    j2 = store.start_job_run("qqq_holdings", {"instrument": "NDX"})
+    store.finish_job_run(j2, status="success", details={"instrument": "NDX"})
+
+    j3 = store.start_job_run("siblis_free", {"instrument": "SPY"})
+    store.finish_job_run(j3, status="failed", error="404 Not Found", details={"instrument": "SPY"})
+    j4 = store.start_job_run("multpl", {"instrument": "SPY"})
+    store.finish_job_run(j4, status="success", details={"instrument": "SPY"})
+    j5 = store.start_job_run("shiller", {"instrument": "SPY"})
+    store.finish_job_run(j5, status="success", details={"instrument": "SPY"})
+    j6 = store.start_job_run("spy_holdings", {"instrument": "SPY"})
+    store.finish_job_run(j6, status="success", details={"instrument": "SPY"})
+
+    ndx_jobs = {j["job"]: j for j in get_snapshot_payload(store, "NDX")["status"]["jobs"]}
+    spy_jobs = {j["job"]: j for j in get_snapshot_payload(store, "SPY")["status"]["jobs"]}
+
+    assert ndx_jobs["siblis_free"]["status"] == "success"
+    assert "qqq_holdings" in ndx_jobs
+    assert "spy_holdings" not in ndx_jobs
+    assert "multpl" not in ndx_jobs
+    assert "shiller" not in ndx_jobs
+
+    assert "siblis_free" not in spy_jobs
+    assert "qqq_holdings" not in spy_jobs
+    assert spy_jobs["multpl"]["status"] == "success"
+    assert spy_jobs["shiller"]["status"] == "success"
+    assert spy_jobs["spy_holdings"]["status"] == "success"

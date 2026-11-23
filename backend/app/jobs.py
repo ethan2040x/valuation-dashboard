@@ -62,22 +62,27 @@ def run_daily_refresh(
     If either upstream data source fails, the failure is recorded in `job_runs` while all
     previously stored snapshots and indicator values remain intact.
     """
-    h_source = holdings_source or get_holdings_source(instrument_symbol)
+    symbol_upper = instrument_symbol.upper()
+    h_source = holdings_source or get_holdings_source(symbol_upper)
     f_source = fundamentals_source or YFinanceFundamentalsSource()
-    source_tag = _source_tag_for_instrument(instrument_symbol)
+    source_tag = _source_tag_for_instrument(symbol_upper)
 
-    overall_job_id = store.start_job_run("daily_refresh", {"instrument": instrument_symbol})
-    instrument = store.get_or_create_instrument(instrument_symbol)
+    overall_job_id = store.start_job_run("daily_refresh", {"instrument": symbol_upper})
+    instrument = store.get_or_create_instrument(symbol_upper)
     instrument_id = int(instrument["id"])
 
-    # Step 1: Fetch QQQ constituent weights
-    holdings_job_id = store.start_job_run(h_source.name)
+    # Step 1: Fetch QQQ/SPY constituent weights
+    holdings_job_id = store.start_job_run(h_source.name, {"instrument": symbol_upper})
     try:
         as_of_date, holdings = h_source.fetch_holdings()
         store.finish_job_run(
             holdings_job_id,
             status="success",
-            details={"as_of_date": as_of_date, "count": len(holdings)},
+            details={
+                "instrument": symbol_upper,
+                "as_of_date": as_of_date,
+                "count": len(holdings),
+            },
         )
     except Exception as exc:
         err_msg = str(exc)
@@ -93,7 +98,7 @@ def run_daily_refresh(
         }
 
     # Step 2: Fetch price, trailing EPS, forward EPS from yfinance
-    yf_job_id = store.start_job_run(f_source.name)
+    yf_job_id = store.start_job_run(f_source.name, {"instrument": symbol_upper})
     try:
         tickers = [h.ticker for h in holdings]
         fundamentals = f_source.fetch_fundamentals(tickers)
@@ -148,6 +153,7 @@ def run_daily_refresh(
                 else None
             ),
             details={
+                "instrument": symbol_upper,
                 "total": len(tickers),
                 "ok_ttm": ok_ttm,
                 "ok_fwd": ok_fwd,
@@ -175,14 +181,14 @@ def run_daily_refresh(
         date=as_of_date,
         quotes=quotes,
     )
-    computed = run_compute_indicators(store, instrument_symbol=instrument_symbol)
+    computed = run_compute_indicators(store, instrument_symbol=symbol_upper)
 
     overall_status = "partial" if failed_tickers else "success"
     store.finish_job_run(
         overall_job_id,
         status=overall_status,
         details={
-            "instrument": instrument_symbol,
+            "instrument": symbol_upper,
             "as_of_date": as_of_date,
             "constituents_saved": saved_constituents,
             "ok_ttm": ok_ttm,
@@ -206,11 +212,16 @@ def run_compute_indicators(
     instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
 ) -> dict[str, int]:
     """Recompute all registered indicators (used after refresh or CSV backfill)."""
-    job_id = store.start_job_run("compute_indicators", {"instrument": instrument_symbol})
+    symbol_upper = instrument_symbol.upper()
+    job_id = store.start_job_run("compute_indicators", {"instrument": symbol_upper})
     try:
         engine = IndicatorEngine(store)
-        counts = engine.compute_all(instrument_symbol=instrument_symbol)
-        store.finish_job_run(job_id, status="success", details={"counts": counts})
+        counts = engine.compute_all(instrument_symbol=symbol_upper)
+        store.finish_job_run(
+            job_id,
+            status="success",
+            details={"instrument": symbol_upper, "counts": counts},
+        )
         return counts
     except Exception as exc:
         store.finish_job_run(job_id, status="failed", error=str(exc))
@@ -226,11 +237,12 @@ def run_csv_import(
     recompute: bool = True,
 ) -> dict[str, Any]:
     """Import historical CSV data into `raw_series` and optionally recompute indicators."""
+    symbol_upper = instrument_symbol.upper()
     job_id = store.start_job_run(
         "csv_import",
         {
             "path": str(csv_path),
-            "instrument": instrument_symbol,
+            "instrument": symbol_upper,
             "source": source,
             "series_id": series_id,
         },
@@ -239,19 +251,23 @@ def run_csv_import(
         counts = import_csv_file(
             store=store,
             csv_path=csv_path,
-            instrument_symbol=instrument_symbol,
+            instrument_symbol=symbol_upper,
             default_source=source,
             series_id=series_id,
         )
         computed = (
-            run_compute_indicators(store, instrument_symbol=instrument_symbol)
+            run_compute_indicators(store, instrument_symbol=symbol_upper)
             if recompute
             else {}
         )
         store.finish_job_run(
             job_id,
             status="success",
-            details={"imported": counts, "computed": computed},
+            details={
+                "instrument": symbol_upper,
+                "imported": counts,
+                "computed": computed,
+            },
         )
         return {"imported": counts, "computed": computed}
     except Exception as exc:

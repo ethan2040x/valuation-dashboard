@@ -104,6 +104,15 @@ CREATE TABLE IF NOT EXISTS app_settings (
 );
 """
 
+_INSTRUMENT_EXCLUSIVE_JOBS: dict[str, set[str]] = {
+    "qqq_holdings": {"NDX"},
+    "spy_holdings": {"SPY"},
+    "siblis_free": {"NDX"},
+    "siblis_paid": {"NDX"},
+    "multpl": {"SPY"},
+    "shiller": {"SPY"},
+}
+
 
 class ValuationStore:
     """Thin SQLite repository encapsulating all 5 tables."""
@@ -667,32 +676,89 @@ class ValuationStore:
                     (utc_now_iso(), status, error, job_id),
                 )
 
-    def get_latest_job_runs(self) -> list[dict[str, Any]]:
-        """Return the most recent run for each distinct job name, plus last_success_at."""
+    def get_latest_job_runs(
+        self,
+        instrument_symbol: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return the most recent run for each distinct job name, plus last_success_at.
+
+        When `instrument_symbol` is specified, filters out runs belonging exclusively to
+        other instruments so NDX and SPY statuses never overwrite each other.
+        """
+        if instrument_symbol is None:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT j.id, j.job, j.started_at, j.finished_at, j.status, j.error, j.details,
+                           (
+                               SELECT MAX(COALESCE(s.finished_at, s.started_at))
+                               FROM job_runs s
+                               WHERE s.job = j.job AND s.status IN ('success', 'partial')
+                           ) AS last_success_at
+                    FROM job_runs j
+                    INNER JOIN (
+                        SELECT job, MAX(id) AS max_id
+                        FROM job_runs
+                        GROUP BY job
+                    ) latest ON j.id = latest.max_id
+                    ORDER BY j.job ASC
+                    """
+                ).fetchall()
+                result = []
+                for r in rows:
+                    item = dict(r)
+                    try:
+                        item["details"] = json.loads(item["details"] or "{}")
+                    except json.JSONDecodeError:
+                        item["details"] = {}
+                    result.append(item)
+                return result
+
+        sym = instrument_symbol.upper()
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT j.id, j.job, j.started_at, j.finished_at, j.status, j.error, j.details,
-                       (
-                           SELECT MAX(COALESCE(s.finished_at, s.started_at))
-                           FROM job_runs s
-                           WHERE s.job = j.job AND s.status IN ('success', 'partial')
-                       ) AS last_success_at
-                FROM job_runs j
-                INNER JOIN (
-                    SELECT job, MAX(id) AS max_id
-                    FROM job_runs
-                    GROUP BY job
-                ) latest ON j.id = latest.max_id
-                ORDER BY j.job ASC
+                SELECT id, job, started_at, finished_at, status, error, details
+                FROM job_runs
+                ORDER BY id DESC
                 """
             ).fetchall()
-            result = []
-            for r in rows:
+
+        latest_by_job: dict[str, dict[str, Any]] = {}
+        last_success_by_job: dict[str, str] = {}
+
+        for r in rows:
+            job_name = r["job"]
+            allowed_syms = _INSTRUMENT_EXCLUSIVE_JOBS.get(job_name)
+            if allowed_syms is not None and sym not in allowed_syms:
+                continue
+
+            try:
+                details = json.loads(r["details"] or "{}")
+            except json.JSONDecodeError:
+                details = {}
+            if not isinstance(details, dict):
+                details = {}
+
+            row_inst = details.get("instrument")
+            if row_inst is not None and str(row_inst).strip().upper() != sym:
+                continue
+
+            if r["status"] in ("success", "partial"):
+                ts = r["finished_at"] or r["started_at"]
+                if ts and (
+                    job_name not in last_success_by_job or ts > last_success_by_job[job_name]
+                ):
+                    last_success_by_job[job_name] = ts
+
+            if job_name not in latest_by_job:
                 item = dict(r)
-                try:
-                    item["details"] = json.loads(item["details"] or "{}")
-                except json.JSONDecodeError:
-                    item["details"] = {}
-                result.append(item)
-            return result
+                item["details"] = details
+                latest_by_job[job_name] = item
+
+        result: list[dict[str, Any]] = []
+        for job_name in sorted(latest_by_job.keys()):
+            item = latest_by_job[job_name]
+            item["last_success_at"] = last_success_by_job.get(job_name)
+            result.append(item)
+        return result

@@ -137,7 +137,7 @@ backend/.venv/bin/pytest backend/tests -v
 
 1. **实时免费计算**：`computed`（`qqq+yfinance` / `spy+yfinance`，基于 Invesco / Slickcharts / iShares 成分股权重与 `yfinance` 股价/EPS）。
 2. **免费公开历史源**：
-   - `siblis_free`：Siblis Research 免密钥公开历史接口（支持 `NDX` / `SPX`）。
+   - `siblis_free`：Siblis Research 免密钥公开历史接口（支持 `NDX`）。
    - `multpl`：Multpl S&P 500 百年月频 PE 表（结合 `^GSPC` 收盘价展开为日频，离线时按 NYSE 交易日历线性插值）。
    - `shiller`：Robert Shiller 公开数据集（`SP500 / Earnings`，作为 Multpl 备源）。
 3. **外部 CSV 导入源**：`csv_import`、`gurufocus_csv`、`macromicro_csv`、`bloomberg_csv`、`wind_csv`（通过 `import-csv` 导入；在 `free_first` 下位于免费历史源之后用于补充缺口，切换为 `external_first` 时优先生效）。
