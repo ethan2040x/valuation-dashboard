@@ -61,9 +61,10 @@ jobs:
           VALUATION_DB_PATH: ${{ github.workspace }}/data/valuation.db
           VALUATION_SINGLEFILE_DIST: ${{ github.workspace }}/frontend/dist-singlefile
         run: |
-          python -m app.jobs seed --instrument ALL
+          python -m app.jobs seed --all
+          python -m app.jobs backfill-history --all --years 20 || true
           python -m app.jobs refresh --instrument NDX
-          python -m app.jobs refresh --instrument SPY
+          python -m app.jobs refresh --instrument SPY || true
           python -m app.jobs export --output _site/index.html
           cp _site/index.html _site/ndx-valuation-snapshot.html
           touch _site/.nojekyll

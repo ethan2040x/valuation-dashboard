@@ -6,12 +6,19 @@ consume the exact same data structures.
 
 from __future__ import annotations
 
+import os
 from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
 
-from app.config import DEFAULT_INSTRUMENT_SYMBOL, INSTRUMENTS
+from app.config import (
+    DATA_SOURCES,
+    DEFAULT_INSTRUMENT_SYMBOL,
+    INSTRUMENTS,
+    SIBLIS_API_KEY,
+    SOURCE_PRIORITY_PROFILES,
+)
 from app.indicators import Indicator, discover_indicators, get_indicator, list_indicators
 from app.models import IndicatorPoint
 from app.store import ValuationStore, utc_now_iso
@@ -20,6 +27,7 @@ RANGE_YEARS: dict[str, int | None] = {
     "1y": 1,
     "5y": 5,
     "10y": 10,
+    "20y": 20,
     "all": None,
 }
 
@@ -295,4 +303,75 @@ def get_snapshot_payload(
             "total_trading_days": len(reference_dates),
             "jobs": job_runs,
         },
+    }
+
+
+def get_sources_payload(
+    store: ValuationStore,
+    instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
+) -> dict[str, Any]:
+    """Return active priority profile, ordered sources, and per-source DB coverage."""
+    instrument = store.get_instrument(instrument_symbol)
+    if instrument is None:
+        raise KeyError(f"Unknown instrument: {instrument_symbol}")
+
+    profile, priority = store.get_source_priority()
+    coverage_map = store.get_source_coverage(int(instrument["id"]))
+
+    ordered_ids = list(
+        dict.fromkeys([*priority, *DATA_SOURCES.keys(), *coverage_map.keys()])
+    )
+    sources_list: list[dict[str, Any]] = []
+    for idx, sid in enumerate(ordered_ids):
+        meta = DATA_SOURCES.get(sid) or {
+            "id": sid,
+            "name": sid,
+            "tier": "external_csv",
+            "kind": "csv",
+            "default_enabled": True,
+            "requires_env": None,
+            "description": "自定义导入来源",
+        }
+        req_env = meta.get("requires_env")
+        if req_env:
+            env_val = os.environ.get(str(req_env), "").strip()
+            if not env_val and req_env == "SIBLIS_API_KEY":
+                env_val = SIBLIS_API_KEY or ""
+            configured = bool(env_val)
+        else:
+            configured = True
+
+        cov = coverage_map.get(sid, {})
+        sources_list.append(
+            {
+                "id": sid,
+                "name": meta["name"],
+                "tier": meta["tier"],
+                "kind": meta["kind"],
+                "default_enabled": bool(meta.get("default_enabled", True)),
+                "requires_env": req_env,
+                "configured": configured,
+                "active_in_db": bool(cov),
+                "priority_rank": idx + 1,
+                "description": meta["description"],
+                "coverage": cov,
+            }
+        )
+
+    profiles = [
+        {
+            "id": p["id"],
+            "label": p["label"],
+            "description": p["description"],
+            "priority": list(p["priority"]),
+        }
+        for p in SOURCE_PRIORITY_PROFILES.values()
+    ]
+
+    return {
+        "instrument": instrument["symbol"],
+        "profile": profile,
+        "priority": priority,
+        "profiles": profiles,
+        "sources": sources_list,
     }

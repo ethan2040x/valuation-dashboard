@@ -11,10 +11,12 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from app.config import (
     DB_PATH,
     DEFAULT_INSTRUMENT_SYMBOL,
+    INSTRUMENTS,
     SCHEDULE_ENABLED,
     STATIC_DIST_DIR,
 )
@@ -22,6 +24,8 @@ from app.indicators import discover_indicators
 from app.jobs import (
     bootstrap_all_seed_data_if_empty,
     create_scheduler,
+    run_backfill_history,
+    run_compute_indicators,
     run_daily_refresh,
 )
 from app.services import (
@@ -30,10 +34,18 @@ from app.services import (
     get_indicators_payload,
     get_instruments_payload,
     get_snapshot_payload,
+    get_sources_payload,
 )
 from app.store import ValuationStore
 
 logger = logging.getLogger(__name__)
+
+
+class SourcePriorityUpdateRequest(BaseModel):
+    profile: str | None = None
+    priority: list[str] | None = None
+    instrument: str = DEFAULT_INSTRUMENT_SYMBOL
+    recompute: bool = True
 
 
 def create_app(
@@ -142,6 +154,48 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/sources")
+    def list_sources(instrument: str = Query(default=DEFAULT_INSTRUMENT_SYMBOL)) -> dict[str, Any]:
+        """Return configured data sources, priority order, and DB coverage."""
+        try:
+            return get_sources_payload(
+                store=app.state.store,
+                instrument_symbol=instrument,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/sources/priority")
+    def update_source_priority(body: SourcePriorityUpdateRequest) -> dict[str, Any]:
+        """Update data source priority preset or custom order and recompute indicators."""
+        try:
+            app.state.store.set_source_priority(
+                priority=body.priority,
+                profile=body.profile,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        if body.recompute:
+            symbols = list(
+                dict.fromkeys(
+                    [
+                        *INSTRUMENTS.keys(),
+                        *[row["symbol"] for row in app.state.store.list_instruments()],
+                    ]
+                )
+            )
+            for sym in symbols:
+                run_compute_indicators(app.state.store, instrument_symbol=sym)
+
+        try:
+            return get_sources_payload(
+                store=app.state.store,
+                instrument_symbol=body.instrument,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/api/jobs/refresh")
     def trigger_refresh(
         instrument: str = Query(default=DEFAULT_INSTRUMENT_SYMBOL),
@@ -152,6 +206,20 @@ def create_app(
             instrument_symbol=instrument,
         )
         return result
+
+    @app.post("/api/jobs/backfill-history")
+    def trigger_backfill_history(
+        instrument: str = Query(default=DEFAULT_INSTRUMENT_SYMBOL),
+        years: int = Query(default=20, ge=1, le=50),
+        include_paid: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        """Fetch historical valuation series from configured adapters (free-only by default)."""
+        return run_backfill_history(
+            store=app.state.store,
+            instrument_symbol=instrument,
+            years=years,
+            include_paid=include_paid,
+        )
 
     # Serve built frontend bundle when available (for single-command deployment)
     if frontend_dist_dir and frontend_dist_dir.exists():

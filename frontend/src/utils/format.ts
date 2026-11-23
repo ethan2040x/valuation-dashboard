@@ -1,11 +1,19 @@
-import type { DisplayConfig, ThresholdBand } from "../types/valuation";
+import type { DisplayConfig, SourceTier, ThresholdBand } from "../types/valuation";
 
 const SOURCE_LABELS: Record<string, string> = {
   computed: "成分股实时计算",
   "qqq+yfinance": "QQQ + yfinance",
   "spy+yfinance": "SPY + yfinance",
+  siblis_free: "Siblis Research (免费)",
+  multpl: "Multpl S&P 500 (免费)",
+  shiller: "Shiller 历史库 (免费)",
   csv_import: "CSV 导入历史",
-  seed_csv: "历史基准 CSV",
+  gurufocus_csv: "GuruFocus CSV",
+  macromicro_csv: "MacroMicro CSV",
+  bloomberg_csv: "Bloomberg CSV",
+  wind_csv: "Wind / Choice CSV",
+  siblis_paid: "Siblis Research (付费)",
+  seed_csv: "内置 20 年基准种子",
 };
 
 const JOB_LABELS: Record<string, string> = {
@@ -15,6 +23,17 @@ const JOB_LABELS: Record<string, string> = {
   yfinance: "yfinance 股价与 EPS",
   csv_import: "CSV 历史导入",
   compute_indicators: "指标计算引擎",
+  backfill_history: "20 年免费历史回填",
+  multpl: "Multpl 历史抓取",
+  shiller: "Shiller 历史抓取",
+  siblis_free: "Siblis 免费历史抓取",
+  siblis_paid: "Siblis 付费历史抓取",
+};
+
+const TIER_LABELS: Record<SourceTier, string> = {
+  free: "免费",
+  external_csv: "外部 CSV",
+  paid: "付费",
 };
 
 export function formatSourceLabel(source: string | null | undefined): string {
@@ -24,6 +43,10 @@ export function formatSourceLabel(source: string | null | undefined): string {
 
 export function formatJobLabel(job: string): string {
   return JOB_LABELS[job] ?? job;
+}
+
+export function formatTierLabel(tier: SourceTier | string): string {
+  return TIER_LABELS[tier as SourceTier] ?? tier;
 }
 
 export function formatValue(

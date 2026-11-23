@@ -67,7 +67,11 @@ class IndicatorEngine:
         source_priority: list[str] | None = None,
     ) -> None:
         self.store = store
-        self.source_priority = list(source_priority or SOURCE_PRIORITY)
+        self.source_priority = (
+            list(source_priority)
+            if source_priority is not None
+            else store.get_source_priority()[1]
+        )
 
     def compute_all(
         self,
@@ -123,6 +127,7 @@ class IndicatorEngine:
                     params=param_set,
                     points=points,
                     computed_at=computed_at,
+                    replace=True,
                 )
                 total_saved += saved
                 if param_set == {} or param_set == ind.display.default_params:

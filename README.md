@@ -11,7 +11,7 @@
 | --- | --- | --- |
 | 前瞻 PE | `pe_fwd` | `1 ÷ Σ(权重 × 未来12个月一致预期EPS ÷ 股价)`；亏损股计入；缺数据股剔除后权重归一；缺数据权重合计 > 5% 标记为“不完整” |
 | 滚动 PE | `pe_ttm` | 同上，EPS 为过去 12 个月实际 EPS；过滤异常正值脏数据（隐含 PE < 1x），保留全部亏损股 |
-| PE 历史分位 | `pe_percentile` | 窗口内 PE ≤ 当前值的交易日占比（5 年 / 10 年，对滚动 PE 和前瞻 PE 分别计算）；实际历史不足 1 年时不显示；超过 1 年但不满窗口时标注“基于 X 年数据” |
+| PE 历史分位 | `pe_percentile` | 窗口内 PE ≤ 当前值的交易日占比（5 年 / 10 年 / 20 年，对滚动 PE 和前瞻 PE 分别计算）；实际历史不足 1 年时不显示；超过 1 年但不满窗口时标注“基于 X 年数据” |
 
 ## 快速启动
 
@@ -45,19 +45,27 @@ npm run dev
 在仓库根目录执行（使用 `backend/.venv/bin/python`）：
 
 ```bash
-# 1. 初始化种子历史数据（仅当 raw_series 为空时执行）
-backend/.venv/bin/python -m app.jobs seed
+# 1. 初始化 / 升级 20 年种子历史数据（NDX 与 SPY）
+backend/.venv/bin/python -m app.jobs seed --all
 
-# 2. 拉取当日 QQQ 成分股权重 + yfinance 股价与 EPS，落库并重算全部指标
-backend/.venv/bin/python -m app.jobs refresh
+# 2. 拉取 20 年免费公开历史（默认仅使用免费源：Siblis 免费层 / Multpl / Shiller）
+backend/.venv/bin/python -m app.jobs backfill-history --all --years 20
 
-# 3. 导入自定义历史 CSV（支持宽表 date,pe_ttm,pe_fwd[,source] 或长表 date,series_id,value[,source]）
+# 3. 拉取当日成分股权重 + yfinance 股价与 EPS，落库并重算全部指标
+backend/.venv/bin/python -m app.jobs refresh --all
+
+# 4. 导入自定义历史 CSV（支持宽表、长表、Siblis / Multpl / MacroMicro 双列表）
 backend/.venv/bin/python -m app.jobs import-csv path/to/history.csv --source gurufocus_csv
+backend/.venv/bin/python -m app.jobs import-csv path/to/two_col.csv --source macromicro_csv --series-id pe_fwd
 
-# 4. 重算 / 回填全部已注册指标
-backend/.venv/bin/python -m app.jobs compute
+# 5. 查看 / 切换数据源优先级（默认 free_first，支持 external_first 或自定义）
+backend/.venv/bin/python -m app.jobs sources --instrument NDX
+backend/.venv/bin/python -m app.jobs set-priority --profile external_first
 
-# 5. 构建单文件前端模板并导出离线静态页面
+# 6. 重算 / 回填全部已注册指标
+backend/.venv/bin/python -m app.jobs compute --all
+
+# 7. 构建单文件前端模板并导出离线静态页面
 npm run --prefix frontend build:static
 backend/.venv/bin/python -m app.jobs export --output dist/ndx-valuation-snapshot.html
 ```
@@ -123,8 +131,22 @@ class EarningsYield(Indicator):
 backend/.venv/bin/pytest backend/tests -v
 ```
 
-## 数据源说明
+## 数据源与优先级说明
 
-- **成分股权重**：优先尝试 Invesco QQQ 官方 CSV 端点，失败自动回退至 Slickcharts Nasdaq-100 权重表，亦支持本地 CSV 文件。
-- **股价与 EPS**：通过 `yfinance` 获取成分股 `currentPrice`、`trailingEps`、`forwardEps`。若拉取失败，失败记录写入 `job_runs` 并在页面状态栏提示，历史成功日期与估值保留不变（不会出现空值或 0）。
-- **历史序列**：仓库内置 `data/seed/ndx_pe_history.csv` 作为初始 10 年参考种子，可随时通过 `import-csv` 导入 GuruFocus / Bloomberg 等外部历史 CSV；同一天存在多来源时按 `SOURCE_PRIORITY`（默认实时计算优先于 CSV 导入）取值，并在走势图中用实线/虚线区分来源。
+看板支持 **实时计算源、免费公开历史源、外部导入 CSV 与可选付费 API**，同日存在多来源时按优先级自动合并，默认配置为 **`free_first`（免费源优先）**：
+
+1. **实时免费计算**：`computed`（`qqq+yfinance` / `spy+yfinance`，基于 Invesco / Slickcharts / iShares 成分股权重与 `yfinance` 股价/EPS）。
+2. **免费公开历史源**：
+   - `siblis_free`：Siblis Research 免密钥公开历史接口（支持 `NDX` / `SPX`）。
+   - `multpl`：Multpl S&P 500 百年月频 PE 表（结合 `^GSPC` 收盘价展开为日频，离线时按 NYSE 交易日历线性插值）。
+   - `shiller`：Robert Shiller 公开数据集（`SP500 / Earnings`，作为 Multpl 备源）。
+3. **外部 CSV 导入源**：`csv_import`、`gurufocus_csv`、`macromicro_csv`、`bloomberg_csv`、`wind_csv`（通过 `import-csv` 导入；在 `free_first` 下位于免费历史源之后用于补充缺口，切换为 `external_first` 时优先生效）。
+4. **可选付费 API**：`siblis_paid`（默认关闭，仅当设置 `SIBLIS_API_KEY` 且显式传 `--include-paid` / `include_paid=true` 时启用）。
+5. **内置 20 年基准种子**：`seed_csv`（`data/seed/ndx_pe_history.csv` 与 `data/seed/spy_pe_history.csv`，覆盖 `2006-01-03` 至今约 20 年 NYSE 交易日，零网络兜底）。
+
+### 相关 REST API
+
+- `GET /api/indicators/{id}/series?instrument=NDX&range=20y`（支持 `1y` / `5y` / `10y` / `20y` / `all`）
+- `GET /api/sources?instrument=NDX`：查看数据源目录、优先级顺序与当前数据库覆盖区间
+- `PUT /api/sources/priority`：切换优先级预设（`free_first` / `external_first`）或提交自定义顺序并自动重算指标
+- `POST /api/jobs/backfill-history?instrument=NDX&years=20&include_paid=false`：拉取免费 20 年历史数据

@@ -21,6 +21,7 @@ const RANGE_OPTIONS: Array<{ key: RangeKey; label: string }> = [
   { key: "1y", label: "1 年" },
   { key: "5y", label: "5 年" },
   { key: "10y", label: "10 年" },
+  { key: "20y", label: "20 年" },
   { key: "all", label: "全部" },
 ];
 
@@ -31,8 +32,16 @@ const SOURCE_STYLE: Record<
   computed: { color: "#2563eb", lineType: "solid", width: 2.5 },
   "qqq+yfinance": { color: "#2563eb", lineType: "solid", width: 2.5 },
   "spy+yfinance": { color: "#2563eb", lineType: "solid", width: 2.5 },
+  siblis_free: { color: "#0284c7", lineType: "solid", width: 2 },
+  multpl: { color: "#0891b2", lineType: "solid", width: 2 },
+  shiller: { color: "#0d9488", lineType: "solid", width: 2 },
   csv_import: { color: "#0f766e", lineType: "dashed", width: 2 },
-  seed_csv: { color: "#64748b", lineType: "dashed", width: 2 },
+  gurufocus_csv: { color: "#7c3aed", lineType: "dashed", width: 2 },
+  macromicro_csv: { color: "#9333ea", lineType: "dashed", width: 2 },
+  bloomberg_csv: { color: "#b45309", lineType: "dashed", width: 2 },
+  wind_csv: { color: "#be185d", lineType: "dashed", width: 2 },
+  siblis_paid: { color: "#c026d3", lineType: "dashed", width: 2 },
+  seed_csv: { color: "#64748b", lineType: "dashed", width: 1.8 },
 };
 
 function getSourceStyle(source: string) {
@@ -326,7 +335,7 @@ export const TrendChart: React.FC<TrendChartProps> = ({
 
       {seriesPayload && seriesPayload.sources.length > 1 && (
         <p className="chart-footnote">
-          注：实线为基于当日成分股权重与盈利实时计算口径，虚线为历史 CSV 导入序列，不同来源的统计口径可能存在细微差异。
+          注：实线为实时成分股计算或免费公开历史口径，虚线为外部 CSV 导入或内置 20 年基准种子序列，不同来源的统计口径可能存在细微差异。
         </p>
       )}
     </section>

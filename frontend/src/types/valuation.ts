@@ -1,4 +1,6 @@
-export type RangeKey = "1y" | "5y" | "10y" | "all";
+export type RangeKey = "1y" | "5y" | "10y" | "20y" | "all";
+
+export type SourceTier = "free" | "external_csv" | "paid";
 
 export interface ThresholdBand {
   label: string;
@@ -146,6 +148,58 @@ export interface InstrumentMeta {
   description: string;
 }
 
+export interface SourceCoverageEntry {
+  min_date: string;
+  max_date: string;
+  count: number;
+}
+
+export interface SourceCatalogItem {
+  id: string;
+  name: string;
+  tier: SourceTier;
+  kind: string;
+  default_enabled: boolean;
+  requires_env: string | null;
+  configured: boolean;
+  active_in_db: boolean;
+  priority_rank: number;
+  description: string;
+  coverage: Record<string, SourceCoverageEntry>;
+}
+
+export interface SourcePriorityProfile {
+  id: string;
+  label: string;
+  description: string;
+  priority: string[];
+}
+
+export interface SourcesPayload {
+  instrument: string;
+  profile: string;
+  priority: string[];
+  profiles: SourcePriorityProfile[];
+  sources: SourceCatalogItem[];
+}
+
+export interface BackfillResult {
+  status: string;
+  instrument: string;
+  start_date: string;
+  include_paid: boolean;
+  total_saved: number;
+  sources: Record<
+    string,
+    {
+      status: string;
+      saved: Record<string, number>;
+      error?: string;
+    }
+  >;
+  indicators_computed: Record<string, number>;
+}
+
 export interface StaticSnapshotBundle {
   mode: "static";
   instrument: string;
@@ -153,9 +207,14 @@ export interface StaticSnapshotBundle {
   generated_at: string;
   indicators: IndicatorMeta[];
   snapshot: SnapshotPayload;
-  series: Record<string, Record<RangeKey, SeriesPayload>>;
+  series: Record<string, Partial<Record<RangeKey, SeriesPayload>>>;
+  sources?: SourcesPayload;
   snapshots?: Record<string, SnapshotPayload>;
-  series_by_instrument?: Record<string, Record<string, Record<RangeKey, SeriesPayload>>>;
+  series_by_instrument?: Record<
+    string,
+    Record<string, Partial<Record<RangeKey, SeriesPayload>>>
+  >;
+  sources_by_instrument?: Record<string, SourcesPayload>;
 }
 
 export interface ValuationDataProvider {
@@ -169,7 +228,17 @@ export interface ValuationDataProvider {
     instrument: string,
     range: RangeKey
   ): Promise<SeriesPayload>;
+  getSources(instrument: string): Promise<SourcesPayload>;
+  updateSourcePriority?(payload: {
+    profile?: string;
+    priority?: string[];
+    instrument: string;
+  }): Promise<SourcesPayload>;
   triggerRefresh?(instrument: string): Promise<RefreshResult>;
+  triggerBackfillHistory?(
+    instrument: string,
+    years?: number
+  ): Promise<BackfillResult>;
 }
 
 declare global {

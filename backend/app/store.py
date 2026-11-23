@@ -9,7 +9,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.config import DB_PATH, DEFAULT_INSTRUMENT_NAME, DEFAULT_INSTRUMENT_SYMBOL, INSTRUMENTS
+from app.config import (
+    DB_PATH,
+    DEFAULT_INSTRUMENT_NAME,
+    DEFAULT_INSTRUMENT_SYMBOL,
+    INSTRUMENTS,
+    SOURCE_PRIORITY_PROFILES,
+    resolve_default_source_priority,
+)
 from app.models import ConstituentQuote, IndicatorPoint
 
 
@@ -89,6 +96,12 @@ CREATE TABLE IF NOT EXISTS job_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_job_runs_job_started
     ON job_runs (job, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -159,10 +172,96 @@ class ValuationStore:
             ).fetchone()
             return dict(row) if row else None
 
-    def list_instruments(self) -> list[dict[str, Any]]:
+    # ------------------------------------------------------------------
+    # app_settings & source priority
+    # ------------------------------------------------------------------
+    def get_setting(self, key: str) -> str | None:
         with self.connect() as conn:
-            rows = conn.execute("SELECT id, symbol, name FROM instruments ORDER BY id").fetchall()
-            return [dict(r) for r in rows]
+            row = conn.execute(
+                "SELECT value FROM app_settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            return str(row["value"]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        ts = utc_now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, ts),
+            )
+
+    def get_source_priority(self) -> tuple[str, list[str]]:
+        """Return `(profile_id, ordered_source_ids)` from `app_settings` or default config."""
+        profile = self.get_setting("source_priority_profile")
+        raw_list = self.get_setting("source_priority_list")
+        if raw_list:
+            try:
+                parsed = json.loads(raw_list)
+                if isinstance(parsed, list):
+                    cleaned = [str(item).strip() for item in parsed if str(item).strip()]
+                    if cleaned:
+                        return (profile or "custom"), cleaned
+            except json.JSONDecodeError:
+                pass
+        if profile and profile in SOURCE_PRIORITY_PROFILES:
+            return profile, list(SOURCE_PRIORITY_PROFILES[profile]["priority"])
+        return resolve_default_source_priority()
+
+    def set_source_priority(
+        self,
+        priority: list[str] | None = None,
+        profile: str | None = None,
+    ) -> tuple[str, list[str]]:
+        """Persist source priority preset or custom order into `app_settings`."""
+        if priority is not None:
+            cleaned = list(
+                dict.fromkeys(str(item).strip() for item in priority if str(item).strip())
+            )
+            if not cleaned:
+                raise ValueError("Source priority list must not be empty")
+            matched_profile = next(
+                (
+                    pid
+                    for pid, meta in SOURCE_PRIORITY_PROFILES.items()
+                    if list(meta["priority"]) == cleaned
+                ),
+                "custom",
+            )
+            effective_profile = matched_profile
+            effective_priority = cleaned
+        elif profile is not None:
+            profile_key = profile.strip().lower()
+            if profile_key not in SOURCE_PRIORITY_PROFILES:
+                raise ValueError(f"Unknown source priority profile: {profile!r}")
+            effective_profile = profile_key
+            effective_priority = list(SOURCE_PRIORITY_PROFILES[profile_key]["priority"])
+        else:
+            raise ValueError("Either profile or priority must be provided")
+
+        ts = utc_now_iso()
+        serialized = json.dumps(effective_priority, ensure_ascii=False)
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    ("source_priority_profile", effective_profile, ts),
+                    ("source_priority_list", serialized, ts),
+                ],
+            )
+        return effective_profile, effective_priority
 
     # ------------------------------------------------------------------
     # constituent_snapshots
@@ -295,6 +394,98 @@ class ValuationStore:
         with self.connect() as conn:
             return [dict(r) for r in conn.execute(query, args).fetchall()]
 
+    def delete_raw_series_by_source(self, instrument_id: int, source: str) -> int:
+        """Delete raw_series rows for one instrument & source (e.g. upgrading seed_csv)."""
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM raw_series WHERE instrument_id = ? AND source = ?",
+                (instrument_id, source),
+            )
+            return int(cur.rowcount)
+
+    def get_source_coverage(self, instrument_id: int) -> dict[str, dict[str, dict[str, Any]]]:
+        """Return `{source_id: {series_id: {min_date, max_date, count}}}` for an instrument."""
+        coverage: dict[str, dict[str, dict[str, Any]]] = {}
+        with self.connect() as conn:
+            raw_rows = conn.execute(
+                """
+                SELECT source, series_id, MIN(date) AS min_date, MAX(date) AS max_date, COUNT(*) AS cnt
+                FROM raw_series
+                WHERE instrument_id = ?
+                GROUP BY source, series_id
+                ORDER BY source ASC, series_id ASC
+                """,
+                (instrument_id,),
+            ).fetchall()
+            for r in raw_rows:
+                coverage.setdefault(r["source"], {})[r["series_id"]] = {
+                    "min_date": r["min_date"],
+                    "max_date": r["max_date"],
+                    "count": int(r["cnt"]),
+                }
+
+            # Constituent snapshots map to `computed` and to their constituent tag (e.g. qqq+yfinance)
+            overall_const = conn.execute(
+                """
+                SELECT
+                    MIN(CASE WHEN price IS NOT NULL AND price > 0 AND eps_ttm IS NOT NULL THEN date END) AS ttm_min,
+                    MAX(CASE WHEN price IS NOT NULL AND price > 0 AND eps_ttm IS NOT NULL THEN date END) AS ttm_max,
+                    COUNT(DISTINCT CASE WHEN price IS NOT NULL AND price > 0 AND eps_ttm IS NOT NULL THEN date END) AS ttm_cnt,
+                    MIN(CASE WHEN price IS NOT NULL AND price > 0 AND eps_fwd IS NOT NULL THEN date END) AS fwd_min,
+                    MAX(CASE WHEN price IS NOT NULL AND price > 0 AND eps_fwd IS NOT NULL THEN date END) AS fwd_max,
+                    COUNT(DISTINCT CASE WHEN price IS NOT NULL AND price > 0 AND eps_fwd IS NOT NULL THEN date END) AS fwd_cnt
+                FROM constituent_snapshots
+                WHERE instrument_id = ?
+                """,
+                (instrument_id,),
+            ).fetchone()
+            if overall_const:
+                if int(overall_const["ttm_cnt"] or 0) > 0:
+                    coverage.setdefault("computed", {})["pe_ttm"] = {
+                        "min_date": overall_const["ttm_min"],
+                        "max_date": overall_const["ttm_max"],
+                        "count": int(overall_const["ttm_cnt"]),
+                    }
+                if int(overall_const["fwd_cnt"] or 0) > 0:
+                    coverage.setdefault("computed", {})["pe_fwd"] = {
+                        "min_date": overall_const["fwd_min"],
+                        "max_date": overall_const["fwd_max"],
+                        "count": int(overall_const["fwd_cnt"]),
+                    }
+
+            per_src_const = conn.execute(
+                """
+                SELECT
+                    source,
+                    MIN(CASE WHEN price IS NOT NULL AND price > 0 AND eps_ttm IS NOT NULL THEN date END) AS ttm_min,
+                    MAX(CASE WHEN price IS NOT NULL AND price > 0 AND eps_ttm IS NOT NULL THEN date END) AS ttm_max,
+                    COUNT(DISTINCT CASE WHEN price IS NOT NULL AND price > 0 AND eps_ttm IS NOT NULL THEN date END) AS ttm_cnt,
+                    MIN(CASE WHEN price IS NOT NULL AND price > 0 AND eps_fwd IS NOT NULL THEN date END) AS fwd_min,
+                    MAX(CASE WHEN price IS NOT NULL AND price > 0 AND eps_fwd IS NOT NULL THEN date END) AS fwd_max,
+                    COUNT(DISTINCT CASE WHEN price IS NOT NULL AND price > 0 AND eps_fwd IS NOT NULL THEN date END) AS fwd_cnt
+                FROM constituent_snapshots
+                WHERE instrument_id = ?
+                GROUP BY source
+                """,
+                (instrument_id,),
+            ).fetchall()
+            for r in per_src_const:
+                src = r["source"]
+                if int(r["ttm_cnt"] or 0) > 0:
+                    coverage.setdefault(src, {})["pe_ttm"] = {
+                        "min_date": r["ttm_min"],
+                        "max_date": r["ttm_max"],
+                        "count": int(r["ttm_cnt"]),
+                    }
+                if int(r["fwd_cnt"] or 0) > 0:
+                    coverage.setdefault(src, {})["pe_fwd"] = {
+                        "min_date": r["fwd_min"],
+                        "max_date": r["fwd_max"],
+                        "count": int(r["fwd_cnt"]),
+                    }
+
+        return coverage
+
     # ------------------------------------------------------------------
     # indicator_values
     # ------------------------------------------------------------------
@@ -305,6 +496,7 @@ class ValuationStore:
         params: dict[str, Any] | None,
         points: list[IndicatorPoint],
         computed_at: str | None = None,
+        replace: bool = False,
     ) -> int:
         if not points:
             return 0
@@ -325,6 +517,14 @@ class ValuationStore:
             for pt in points
         ]
         with self.connect() as conn:
+            if replace:
+                conn.execute(
+                    """
+                    DELETE FROM indicator_values
+                    WHERE instrument_id = ? AND indicator_id = ? AND params = ?
+                    """,
+                    (instrument_id, indicator_id, params_json),
+                )
             conn.executemany(
                 """
                 INSERT INTO indicator_values

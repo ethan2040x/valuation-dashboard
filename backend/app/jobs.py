@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import logging
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +26,8 @@ from app.config import (
 from app.engine import IndicatorEngine
 from app.models import ConstituentQuote
 from app.sources.base import FundamentalsSource, HoldingsSource
-from app.sources.csv_import import import_csv_file
+from app.sources.csv_import import _normalize_date, import_csv_file
+from app.sources.history_sources import HistoricalSeriesSource, get_historical_sources
 from app.sources.qqq_holdings import QQQHoldingsSource
 from app.sources.spy_holdings import SPYHoldingsSource
 from app.sources.yfinance_source import YFinanceFundamentalsSource
@@ -218,12 +222,18 @@ def run_csv_import(
     csv_path: str | Path,
     instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
     source: str = "csv_import",
+    series_id: str | None = None,
     recompute: bool = True,
 ) -> dict[str, Any]:
     """Import historical CSV data into `raw_series` and optionally recompute indicators."""
     job_id = store.start_job_run(
         "csv_import",
-        {"path": str(csv_path), "instrument": instrument_symbol, "source": source},
+        {
+            "path": str(csv_path),
+            "instrument": instrument_symbol,
+            "source": source,
+            "series_id": series_id,
+        },
     )
     try:
         counts = import_csv_file(
@@ -231,6 +241,7 @@ def run_csv_import(
             csv_path=csv_path,
             instrument_symbol=instrument_symbol,
             default_source=source,
+            series_id=series_id,
         )
         computed = (
             run_compute_indicators(store, instrument_symbol=instrument_symbol)
@@ -248,21 +259,48 @@ def run_csv_import(
         raise
 
 
+def _read_earliest_csv_date(csv_file: Path) -> str | None:
+    """Inspect a seed CSV file and return its earliest valid ISO date."""
+    try:
+        with csv_file.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return None
+            lower_fields = {name.strip().lower(): name.strip() for name in reader.fieldnames if name}
+            date_col = lower_fields.get("date")
+            if not date_col:
+                return None
+            earliest: str | None = None
+            for row in reader:
+                raw_date = (row.get(date_col) or "").strip()
+                if not raw_date:
+                    continue
+                try:
+                    iso = _normalize_date(raw_date)
+                except ValueError:
+                    continue
+                if earliest is None or iso < earliest:
+                    earliest = iso
+            return earliest
+    except Exception:
+        return None
+
+
 def bootstrap_seed_data_if_empty(
     store: ValuationStore,
     seed_dir: Path = SEED_DIR,
     instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
+    force: bool = False,
 ) -> bool:
-    """Import seed CSVs from `data/seed/` if `raw_series` is currently empty for an instrument."""
-    symbol_upper = instrument_symbol.upper()
-    instrument = store.get_or_create_instrument(symbol_upper)
-    existing = store.get_raw_series(int(instrument["id"]), "pe_ttm")
-    if existing:
-        return False
+    """Import seed CSVs from `data/seed/` if empty or if a longer seed history is available.
 
+    When upgrading an existing `seed_csv` dataset (e.g. from 10y to 20y), only `seed_csv`
+    rows are replaced; any live `computed`, free historical, or imported CSV rows are preserved.
+    """
     if not seed_dir.exists():
         return False
 
+    symbol_upper = instrument_symbol.upper()
     meta = INSTRUMENTS.get(symbol_upper)
     if meta and meta.get("seed_file"):
         candidate = seed_dir / meta["seed_file"]
@@ -275,6 +313,30 @@ def bootstrap_seed_data_if_empty(
 
     if not csv_files:
         return False
+
+    instrument = store.get_or_create_instrument(symbol_upper)
+    instrument_id = int(instrument["id"])
+    existing_all = store.get_raw_series(instrument_id, "pe_ttm")
+    existing_seed = store.get_raw_series(instrument_id, "pe_ttm", source="seed_csv")
+
+    earliest_candidates = [d for d in (_read_earliest_csv_date(p) for p in csv_files) if d]
+    csv_earliest = min(earliest_candidates) if earliest_candidates else None
+
+    should_upgrade_seed = bool(
+        existing_seed and csv_earliest and csv_earliest < existing_seed[0]["date"]
+    )
+
+    if not force and existing_all and not should_upgrade_seed:
+        return False
+
+    if (force or should_upgrade_seed) and existing_seed:
+        removed = store.delete_raw_series_by_source(instrument_id, "seed_csv")
+        logger.info(
+            "Replacing %d existing seed_csv rows for %s (earliest seed date -> %s)",
+            removed,
+            symbol_upper,
+            csv_earliest,
+        )
 
     imported_any = False
     for csv_file in csv_files:
@@ -296,16 +358,150 @@ def bootstrap_seed_data_if_empty(
 def bootstrap_all_seed_data_if_empty(
     store: ValuationStore,
     seed_dir: Path = SEED_DIR,
+    force: bool = False,
 ) -> dict[str, bool]:
-    """Bootstrap seed CSVs for all configured instruments that have empty data."""
+    """Bootstrap seed CSVs for all configured instruments that have empty or upgradable seed data."""
     return {
         symbol: bootstrap_seed_data_if_empty(
             store=store,
             seed_dir=seed_dir,
             instrument_symbol=symbol,
+            force=force,
         )
         for symbol in INSTRUMENTS
     }
+
+
+def run_backfill_history(
+    store: ValuationStore,
+    instrument_symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
+    years: int = 20,
+    include_paid: bool = False,
+    sources: list[str] | None = None,
+    adapters: list[HistoricalSeriesSource] | None = None,
+    recompute: bool = True,
+) -> dict[str, Any]:
+    """Fetch historical index P/E series from configured adapters (defaults to free-only)."""
+    symbol_upper = instrument_symbol.upper()
+    today = date.today()
+    start_year = max(1970, today.year - max(1, int(years)))
+    start_date = date(start_year, 1, 1).isoformat()
+
+    overall_job_id = store.start_job_run(
+        "backfill_history",
+        {
+            "instrument": symbol_upper,
+            "years": years,
+            "start_date": start_date,
+            "include_paid": include_paid,
+            "sources": sources,
+        },
+    )
+
+    instrument = store.get_or_create_instrument(symbol_upper)
+    instrument_id = int(instrument["id"])
+
+    if adapters is not None:
+        requested = {s.strip() for s in sources} if sources else None
+        selected_adapters = [
+            adp
+            for adp in adapters
+            if adp.supports(symbol_upper)
+            and (requested is None or adp.source_id in requested)
+            and (adp.tier != "paid" or (include_paid and adp.is_configured()))
+        ]
+    else:
+        selected_adapters = get_historical_sources(
+            instrument_symbol=symbol_upper,
+            include_paid=include_paid,
+            source_ids=sources,
+        )
+
+    source_results: dict[str, dict[str, Any]] = {}
+    total_saved = 0
+    succeeded = 0
+    failed = 0
+
+    for adapter in selected_adapters:
+        src_job_id = store.start_job_run(
+            adapter.source_id,
+            {"instrument": symbol_upper, "start_date": start_date},
+        )
+        try:
+            series_map = adapter.fetch_history(symbol_upper, start_date=start_date)
+            saved_by_series: dict[str, int] = {}
+            for sid, rows in series_map.items():
+                if not rows:
+                    continue
+                cnt = store.save_raw_series(
+                    instrument_id=instrument_id,
+                    series_id=sid,
+                    rows=rows,
+                    source=adapter.source_id,
+                )
+                saved_by_series[sid] = cnt
+                total_saved += cnt
+
+            if saved_by_series:
+                store.finish_job_run(
+                    src_job_id,
+                    status="success",
+                    details={"instrument": symbol_upper, "saved": saved_by_series},
+                )
+                source_results[adapter.source_id] = {
+                    "status": "success",
+                    "saved": saved_by_series,
+                }
+                succeeded += 1
+            else:
+                store.finish_job_run(
+                    src_job_id,
+                    status="partial",
+                    error="No historical points returned",
+                    details={"instrument": symbol_upper, "saved": {}},
+                )
+                source_results[adapter.source_id] = {
+                    "status": "empty",
+                    "saved": {},
+                }
+        except Exception as exc:
+            err_msg = str(exc)
+            logger.warning(
+                "Historical backfill failed for %s / %s: %s",
+                symbol_upper,
+                adapter.source_id,
+                err_msg,
+            )
+            store.finish_job_run(src_job_id, status="failed", error=err_msg)
+            source_results[adapter.source_id] = {
+                "status": "failed",
+                "error": err_msg,
+                "saved": {},
+            }
+            failed += 1
+
+    computed: dict[str, int] = {}
+    if recompute and total_saved > 0:
+        computed = run_compute_indicators(store, instrument_symbol=symbol_upper)
+
+    if failed > 0 and succeeded == 0 and total_saved == 0:
+        overall_status = "failed"
+    elif failed > 0:
+        overall_status = "partial"
+    else:
+        overall_status = "success"
+
+    summary = {
+        "status": overall_status,
+        "instrument": symbol_upper,
+        "start_date": start_date,
+        "include_paid": include_paid,
+        "total_saved": total_saved,
+        "sources": source_results,
+        "indicators_computed": computed,
+    }
+    store.finish_job_run(overall_job_id, status=overall_status, details=summary)
+    return summary
 
 
 def create_scheduler(store: ValuationStore) -> BackgroundScheduler:
@@ -338,19 +534,50 @@ def _cli() -> None:
     parser.add_argument("--db", default=str(DB_PATH), help="Path to SQLite database")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_refresh = sub.add_parser("refresh", help="Fetch live QQQ + yfinance data and compute indicators")
+    p_refresh = sub.add_parser("refresh", help="Fetch live QQQ/SPY + yfinance data and compute indicators")
     p_refresh.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
+    p_refresh.add_argument("--all", action="store_true", help="Refresh all configured instruments")
 
     p_import = sub.add_parser("import-csv", help="Import historical CSV series")
     p_import.add_argument("csv_path", help="Path to CSV file")
     p_import.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
     p_import.add_argument("--source", default="csv_import")
+    p_import.add_argument("--series-id", default=None, help="Target series_id for 2-column CSVs")
 
-    p_seed = sub.add_parser("seed", help="Bootstrap seed CSV files if database is empty")
+    p_seed = sub.add_parser("seed", help="Bootstrap or upgrade seed CSV files")
     p_seed.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
+    p_seed.add_argument("--all", action="store_true", help="Seed all configured instruments")
+    p_seed.add_argument("--force", action="store_true", help="Force re-import of seed_csv")
+
+    p_backfill = sub.add_parser(
+        "backfill-history",
+        help="Fetch 20y historical valuation data from external adapters (free sources by default)",
+    )
+    p_backfill.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
+    p_backfill.add_argument("--all", action="store_true", help="Backfill all configured instruments")
+    p_backfill.add_argument("--years", type=int, default=20)
+    p_backfill.add_argument(
+        "--include-paid",
+        action="store_true",
+        help="Also query configured paid historical sources (requires API key)",
+    )
+    p_backfill.add_argument(
+        "--sources",
+        default=None,
+        help="Comma-separated list of historical source IDs to query",
+    )
+
+    p_sources = sub.add_parser("sources", help="Show active source priority and database coverage")
+    p_sources.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
+
+    p_prio = sub.add_parser("set-priority", help="Set data source priority preset or custom order")
+    p_prio.add_argument("--profile", default=None, help="Preset profile (free_first | external_first)")
+    p_prio.add_argument("--priority", default=None, help="Comma-separated source priority list")
+    p_prio.add_argument("--no-recompute", action="store_true", help="Skip indicator recomputation")
 
     p_compute = sub.add_parser("compute", help="Recompute all registered indicators (backfill)")
     p_compute.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
+    p_compute.add_argument("--all", action="store_true", help="Compute all configured instruments")
 
     p_export = sub.add_parser("export", help="Export single-file static HTML snapshot")
     p_export.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
@@ -360,7 +587,7 @@ def _cli() -> None:
     store = ValuationStore(args.db)
 
     if args.command == "refresh":
-        if args.instrument.upper() == "ALL":
+        if args.all or args.instrument.upper() == "ALL":
             res = {sym: run_daily_refresh(store, instrument_symbol=sym) for sym in INSTRUMENTS}
         else:
             res = run_daily_refresh(store, instrument_symbol=args.instrument)
@@ -371,17 +598,82 @@ def _cli() -> None:
             csv_path=args.csv_path,
             instrument_symbol=args.instrument,
             source=args.source,
+            series_id=args.series_id,
         )
         print(res)
     elif args.command == "seed":
-        if args.instrument.upper() == "ALL":
-            results = bootstrap_all_seed_data_if_empty(store)
+        if args.all or args.instrument.upper() == "ALL":
+            results = bootstrap_all_seed_data_if_empty(store, force=args.force)
             print({"seeded": results})
         else:
-            did_seed = bootstrap_seed_data_if_empty(store, instrument_symbol=args.instrument)
+            did_seed = bootstrap_seed_data_if_empty(
+                store, instrument_symbol=args.instrument, force=args.force
+            )
             print({"seeded": did_seed})
+    elif args.command == "backfill-history":
+        src_list = (
+            [s.strip() for s in args.sources.split(",") if s.strip()]
+            if args.sources
+            else None
+        )
+        if args.all or args.instrument.upper() == "ALL":
+            res = {
+                sym: run_backfill_history(
+                    store,
+                    instrument_symbol=sym,
+                    years=args.years,
+                    include_paid=args.include_paid,
+                    sources=src_list,
+                )
+                for sym in INSTRUMENTS
+            }
+        else:
+            res = run_backfill_history(
+                store,
+                instrument_symbol=args.instrument,
+                years=args.years,
+                include_paid=args.include_paid,
+                sources=src_list,
+            )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+    elif args.command == "sources":
+        from app.services import get_sources_payload
+
+        print(
+            json.dumps(
+                get_sources_payload(store, instrument_symbol=args.instrument),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "set-priority":
+        prio_list = (
+            [s.strip() for s in args.priority.split(",") if s.strip()]
+            if args.priority
+            else None
+        )
+        eff_profile, eff_prio = store.set_source_priority(
+            priority=prio_list,
+            profile=args.profile,
+        )
+        computed = (
+            {}
+            if args.no_recompute
+            else {sym: run_compute_indicators(store, instrument_symbol=sym) for sym in INSTRUMENTS}
+        )
+        print(
+            json.dumps(
+                {
+                    "profile": eff_profile,
+                    "priority": eff_prio,
+                    "recomputed": computed,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     elif args.command == "compute":
-        if args.instrument.upper() == "ALL":
+        if args.all or args.instrument.upper() == "ALL":
             res = {sym: run_compute_indicators(store, instrument_symbol=sym) for sym in INSTRUMENTS}
         else:
             res = run_compute_indicators(store, instrument_symbol=args.instrument)
