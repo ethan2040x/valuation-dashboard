@@ -5,7 +5,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def _detect_project_root() -> Path:
+    candidate = Path(__file__).resolve().parents[2]
+    if (candidate / "data").exists() or (candidate / "frontend").exists():
+        return candidate
+    return Path.cwd()
+
+
+PROJECT_ROOT = _detect_project_root()
 DATA_DIR = Path(os.environ.get("VALUATION_DATA_DIR", str(PROJECT_ROOT / "data")))
 SEED_DIR = DATA_DIR / "seed"
 DB_PATH = Path(os.environ.get("VALUATION_DB_PATH", str(DATA_DIR / "valuation.db")))

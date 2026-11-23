@@ -39,7 +39,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install backend dependencies
-        run: pip install ./backend
+        run: pip install -e ./backend
 
       - name: Build single-file frontend template
         working-directory: frontend
@@ -51,11 +51,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data/valuation.db
-          key: valuation-db-${{ github.run_id }}
+          key: valuation-db-v2-${{ github.run_id }}
           restore-keys: |
-            valuation-db-
+            valuation-db-v2-
 
       - name: Seed history, refresh live valuation, and export Pages site
+        env:
+          VALUATION_DATA_DIR: ${{ github.workspace }}/data
+          VALUATION_DB_PATH: ${{ github.workspace }}/data/valuation.db
+          VALUATION_SINGLEFILE_DIST: ${{ github.workspace }}/frontend/dist-singlefile
         run: |
           python -m app.jobs seed
           python -m app.jobs refresh
