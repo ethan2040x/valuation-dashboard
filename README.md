@@ -64,6 +64,18 @@ backend/.venv/bin/python -m app.jobs export --output dist/ndx-valuation-snapshot
 
 导出完成后，直接双击 `dist/ndx-valuation-snapshot.html` 即可在断网环境下打开，数值与动态看板完全一致，页头显示快照生成时间，不显示“手动刷新”按钮。
 
+## GitHub Pages 自动部署
+
+仓库已内置工作流 [.github/workflows/deploy-pages.yml](.github/workflows/deploy-pages.yml)，支持将单文件静态快照自动发布到 GitHub Pages，并按美股交易日自动刷新：
+
+1. 将代码推送到 `main` 分支。
+2. 在 GitHub 仓库页面打开 **Settings → Pages → Build and deployment → Source**，选择 **GitHub Actions**。
+3. 工作流会在以下时机自动构建并发布站点：
+   - 每次推送到 `main` 分支；
+   - 每个美股交易日收盘后（周一至周五 `23:30 UTC`，对应美东 `18:30 EST` / `19:30 EDT`），通过 GitHub Actions Cache 保留历史累积库，自动拉取最新 QQQ 持仓与 `yfinance` 数据并重生成快照；
+   - 在 **Actions** 页面手动点击 **Run workflow**。
+4. 部署完成后访问：`https://<username>.github.io/valuation-dashboard/`（同时提供 `/ndx-valuation-snapshot.html` 直链）。
+
 ## 如何新增一个指标（API & 前端零改动）
 
 以新增 **盈利收益率**（`1 ÷ 滚动 PE × 100%`）为例，只需在 `backend/app/indicators/` 新建 `earnings_yield.py`：
