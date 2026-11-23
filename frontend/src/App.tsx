@@ -28,6 +28,8 @@ export const App: React.FC = () => {
   const percentileRef = useRef<HTMLElement>(null);
   const detailRef = useRef<HTMLDivElement>(null);
   const pollTimerRef = useRef<number | null>(null);
+  const watchlistFetchedRef = useRef(false);
+  const prevSeriesSymbolRef = useRef<string>("");
 
   const [activeTab, setActiveTab] = useState<"indices" | "equities">("indices");
   const [instruments, setInstruments] = useState<InstrumentMeta[]>([]);
@@ -88,22 +90,14 @@ export const App: React.FC = () => {
   }, [stopPolling]);
 
   const loadBootstrap = useCallback(async () => {
-    const [insts, inds, overview] = await Promise.all([
+    // Load only index & instrument metadata initially; defer watchlist overview until tab click
+    const [insts, inds] = await Promise.all([
       provider.getInstruments(),
       provider.getIndicators(),
-      provider.getWatchlistOverview("equity"),
     ]);
     setInstruments(insts);
     setIndicators(inds);
-    setWatchlistOverview(overview);
 
-    const firstEq = insts.find((i) => i.kind === "equity")?.symbol ?? "";
-    setSelectedEquitySymbol((prev) => {
-      if (prev && insts.some((i) => i.symbol === prev && i.kind === "equity")) {
-        return prev;
-      }
-      return firstEq;
-    });
     setSelectedId((prev) => {
       if (prev && inds.some((i) => i.id === prev && i.display.chartable)) {
         return prev;
@@ -145,7 +139,10 @@ export const App: React.FC = () => {
       ]);
       setInstruments(insts);
       setWatchlistOverview(overview);
-      const firstEq = insts.find((i) => i.kind === "equity")?.symbol ?? "";
+      const firstEq =
+        overview.items[0]?.instrument.symbol ??
+        insts.find((i) => i.kind === "equity")?.symbol ??
+        "";
       setSelectedEquitySymbol((prev) =>
         prev && insts.some((i) => i.symbol === prev && i.kind === "equity")
           ? prev
@@ -177,8 +174,31 @@ export const App: React.FC = () => {
     };
   }, [loadBootstrap]);
 
+  // Lazy-load equity watchlist overview only when user enters "自选公司" tab
+  useEffect(() => {
+    if (
+      activeTab === "equities" &&
+      !initialLoading &&
+      !watchlistFetchedRef.current
+    ) {
+      watchlistFetchedRef.current = true;
+      void reloadWatchlist().catch((err) => {
+        watchlistFetchedRef.current = false;
+        setBanner({
+          kind: "error",
+          text: `加载自选公司总览失败：${err instanceof Error ? err.message : String(err)}`,
+        });
+      });
+    }
+  }, [activeTab, initialLoading, reloadWatchlist]);
+
   useEffect(() => {
     if (initialLoading) return;
+    if (!activeSymbol) {
+      setSnapshot(null);
+      setSourcesPayload(null);
+      return;
+    }
     let cancelled = false;
     loadDetail(activeSymbol).catch((err) => {
       if (!cancelled) {
@@ -217,9 +237,14 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     if (!initialLoading && selectedId && activeSymbol) {
+      if (prevSeriesSymbolRef.current !== activeSymbol) {
+        setSeriesPayload(null);
+        prevSeriesSymbolRef.current = activeSymbol;
+      }
       void loadSeries(selectedId, activeSymbol, range);
     } else if (!activeSymbol) {
       setSeriesPayload(null);
+      prevSeriesSymbolRef.current = "";
     }
   }, [initialLoading, selectedId, activeSymbol, range, loadSeries]);
 
@@ -750,7 +775,12 @@ export const App: React.FC = () => {
       )}
 
       {initialLoading ? (
-        <div className="loading-shell">正在加载估值数据…</div>
+        <div className="loading-shell">
+          <div className="loading-shell__inner">
+            <span className="wl-spinner" aria-hidden="true" />
+            <span>正在加载估值看板…</span>
+          </div>
+        </div>
       ) : (
         <main className="main-stack">
           {activeTab === "equities" && (
@@ -861,7 +891,13 @@ export const App: React.FC = () => {
                 </section>
               )}
 
-              {snapshot ? (
+              {detailLoading &&
+              (!snapshot || snapshot.instrument.symbol !== activeSymbol) ? (
+                <div className="detail-loading-card" role="status">
+                  <span className="wl-spinner" aria-hidden="true" />
+                  <span>正在按需加载 {activeSymbol} 估值详情与历史走势…</span>
+                </div>
+              ) : snapshot ? (
                 <>
                   <IndicatorCardRow
                     indicators={indicators}
@@ -906,9 +942,14 @@ export const App: React.FC = () => {
                 </>
               ) : (
                 <div className="loading-shell">
-                  {detailLoading
-                    ? `正在加载 ${activeSymbol} 估值数据…`
-                    : "未能获取估值数据，请检查后端服务状态。"}
+                  {detailLoading ? (
+                    <div className="loading-shell__inner">
+                      <span className="wl-spinner" aria-hidden="true" />
+                      <span>正在加载 {activeSymbol} 估值数据…</span>
+                    </div>
+                  ) : (
+                    "未能获取估值数据，请检查后端服务状态。"
+                  )}
                 </div>
               )}
             </div>

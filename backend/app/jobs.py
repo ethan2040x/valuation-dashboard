@@ -1027,6 +1027,15 @@ def _cli() -> None:
     p_export.add_argument("--indices-only", action="store_true", help="Export index instruments only")
     p_export.add_argument("--symbols", default=None, help="Comma-separated list of symbols to include")
 
+    p_export_site = sub.add_parser(
+        "export-site",
+        help="Export split lazy-loaded static site directory (cacheable assets + on-demand JSON)",
+    )
+    p_export_site.add_argument("--instrument", default=DEFAULT_INSTRUMENT_SYMBOL)
+    p_export_site.add_argument("--output-dir", default="_site")
+    p_export_site.add_argument("--indices-only", action="store_true", help="Export index instruments only")
+    p_export_site.add_argument("--symbols", default=None, help="Comma-separated list of symbols to include")
+
     args = parser.parse_args()
     store = ValuationStore(args.db)
 
@@ -1185,6 +1194,22 @@ def _cli() -> None:
             symbols=sym_list,
         )
         print({"exported": str(out)})
+    elif args.command == "export-site":
+        from app.export import export_static_site
+
+        sym_list = (
+            [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+            if args.symbols
+            else None
+        )
+        out_dir = export_static_site(
+            store=store,
+            output_dir=Path(args.output_dir),
+            instrument_symbol=args.instrument,
+            include_equities=not args.indices_only,
+            symbols=sym_list,
+        )
+        print({"exported_site": str(out_dir)})
 
 
 if __name__ == "__main__":

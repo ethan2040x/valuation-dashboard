@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from app.api import create_app
 from app.config import DEFAULT_EQUITIES
-from app.export import build_static_snapshot_bundle, export_static_html
+from app.export import build_static_snapshot_bundle, export_static_html, export_static_site
 from app.jobs import (
     run_compute_indicators,
     run_csv_import,
@@ -415,3 +415,94 @@ def test_cli_csv_import_auto_multi_ticker_recomputes_without_auto_instrument(tmp
     adbe_snap = get_snapshot_payload(store, "ADBE")
     assert msft_snap["indicators"]["pe_ttm"]["latest"]["value"] == 34.0
     assert adbe_snap["indicators"]["pe_fwd"]["latest"]["value"] == 21.0
+
+
+def test_compact_columnar_bundle_deduplication_and_export_static_site(tmp_path):
+    """Verify columnar compact encoding, primary deduplication, and split static site export."""
+    store = ValuationStore(tmp_path / "site.db")
+    ndx_id = int(store.get_instrument("NDX")["id"])
+    nvda_id = int(store.get_instrument("NVDA")["id"])
+
+    from app.models import ConstituentQuote
+
+    store.save_raw_series(
+        ndx_id,
+        "pe_ttm",
+        [("2026-11-19", 30.1), ("2026-11-20", 30.5)],
+        source="seed_csv",
+    )
+    store.save_constituent_snapshots(
+        ndx_id,
+        "2026-11-21",
+        [
+            ConstituentQuote("NVDA", 0.90, price=100.0, eps_ttm=4.0, eps_fwd=5.0),
+            ConstituentQuote("MISS", 0.10, price=None, eps_ttm=None, eps_fwd=None),
+        ],
+    )
+    store.save_raw_series(
+        nvda_id,
+        "pe_ttm",
+        [("2026-11-19", 40.0), ("2026-11-20", 41.0)],
+        source="sec_edgar",
+    )
+    run_compute_indicators(store, "NDX")
+    run_compute_indicators(store, "NVDA")
+
+    bundle = build_static_snapshot_bundle(
+        store,
+        instrument_symbol="NDX",
+        compact_ranges=True,
+        compact_points=True,
+        deduplicate_primary=True,
+    )
+    # Primary NDX deduplicated from secondary maps
+    assert "NDX" not in bundle["snapshots"]
+    assert "NDX" not in bundle["series_by_instrument"]
+    assert "NDX" not in bundle["sources_by_instrument"]
+
+    # Columnar encoding preserves dates, values, sources, and is_incomplete flag
+    ndx_ttm = bundle["series"]["pe_ttm"]["all"]
+    assert "series" not in ndx_ttm
+    compact = ndx_ttm["compact"]
+    assert compact["s"] == ["seed_csv", "computed"]
+    assert compact["d"] == [
+        ["2026-11-19", 30.1, 0],
+        ["2026-11-20", 30.5, 0],
+        ["2026-11-21", 25.0, 1, 1],
+    ]
+
+    # Mock built frontend dist dir and run export_static_site
+    fake_dist = tmp_path / "dist"
+    (fake_dist / "assets").mkdir(parents=True)
+    (fake_dist / "assets" / "app.js").write_text("console.log('ok');", encoding="utf-8")
+    (fake_dist / "index.html").write_text(
+        "<!doctype html><html><head><title>Test</title></head><body></body></html>",
+        encoding="utf-8",
+    )
+
+    out_site = tmp_path / "_site"
+    export_static_site(store, output_dir=out_site, frontend_dist_dir=fake_dist)
+
+    site_html = (out_site / "index.html").read_text(encoding="utf-8")
+    assert 'window.__VALUATION_SITE__={"dataBase":"./data"};' in site_html
+    assert (out_site / "assets" / "app.js").exists()
+
+    boot = json.loads((out_site / "data" / "bootstrap.json").read_text(encoding="utf-8"))
+    assert boot["mode"] == "static_site"
+    assert "NDX" in boot["index_snapshots"]
+    assert "NDX" in boot["index_sources"]
+    assert "watchlist_overview" not in boot
+    assert "series" not in boot
+
+    wl = json.loads((out_site / "data" / "watchlist.json").read_text(encoding="utf-8"))
+    assert wl["kind"] == "equity"
+    assert wl["count"] == len(DEFAULT_EQUITIES)
+
+    ndx_file = json.loads((out_site / "data" / "instruments" / "NDX.json").read_text(encoding="utf-8"))
+    assert ndx_file["kind"] == "index"
+    assert "compact" in ndx_file["series"]["pe_ttm"]["all"]
+
+    nvda_file = json.loads((out_site / "data" / "instruments" / "NVDA.json").read_text(encoding="utf-8"))
+    assert nvda_file["kind"] == "equity"
+    assert nvda_file["snapshot"]["indicators"]["pe_ttm"]["latest"]["value"] == 41.0
+    assert "compact" in nvda_file["series"]["pe_ttm"]["all"]

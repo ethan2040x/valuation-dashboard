@@ -1,5 +1,19 @@
 import React, { useEffect, useMemo, useRef } from "react";
-import * as echarts from "echarts";
+import * as echarts from "echarts/core";
+import { LineChart, type LineSeriesOption } from "echarts/charts";
+import {
+  GridComponent,
+  type GridComponentOption,
+  LegendComponent,
+  type LegendComponentOption,
+  MarkAreaComponent,
+  type MarkAreaComponentOption,
+  MarkLineComponent,
+  type MarkLineComponentOption,
+  TooltipComponent,
+  type TooltipComponentOption,
+} from "echarts/components";
+import { CanvasRenderer } from "echarts/renderers";
 import type {
   IndicatorMeta,
   RangeKey,
@@ -8,6 +22,25 @@ import type {
 } from "../types/valuation";
 import { formatSourceLabel, formatValue } from "../utils/format";
 import { FormulaExplainer } from "./FormulaExplainer";
+
+echarts.use([
+  LineChart,
+  GridComponent,
+  TooltipComponent,
+  LegendComponent,
+  MarkLineComponent,
+  MarkAreaComponent,
+  CanvasRenderer,
+]);
+
+type TrendChartOption = echarts.ComposeOption<
+  | LineSeriesOption
+  | GridComponentOption
+  | TooltipComponentOption
+  | LegendComponentOption
+  | MarkLineComponentOption
+  | MarkAreaComponentOption
+>;
 
 interface TrendChartProps {
   indicator: IndicatorMeta;
@@ -83,7 +116,7 @@ export const TrendChart: React.FC<TrendChartProps> = ({
 
     // Split into per-source series so computed vs CSV-imported data use distinct line styles.
     // Bridge adjacent transitions by repeating the boundary point in the incoming source series.
-    const seriesList: echarts.SeriesOption[] = distinctSources.map((src, sIdx) => {
+    const seriesList: LineSeriesOption[] = distinctSources.map((src, sIdx) => {
       const style = getSourceStyle(src);
       const data: Array<number | null> = points.map((pt, idx) => {
         if (pt.source === src) return pt.value;
@@ -95,8 +128,8 @@ export const TrendChart: React.FC<TrendChartProps> = ({
       });
 
       const isPrimaryOverlayHolder = sIdx === 0;
-      const markLineData: Array<Record<string, unknown>> = [];
-      const markAreaData: Array<[Record<string, unknown>, Record<string, unknown>]> = [];
+      const markLineData: NonNullable<MarkLineComponentOption["data"]> = [];
+      const markAreaData: NonNullable<MarkAreaComponentOption["data"]> = [];
 
       if (isPrimaryOverlayHolder && seriesPayload.stats.mean !== null) {
         for (const ref of indicator.display.reference_lines) {
@@ -196,7 +229,7 @@ export const TrendChart: React.FC<TrendChartProps> = ({
       return;
     }
 
-    const option: echarts.EChartsOption = {
+    const option: TrendChartOption = {
       animation: true,
       animationDuration: 300,
       grid: { top: 44, left: 56, right: 24, bottom: 38 },

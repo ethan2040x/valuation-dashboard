@@ -41,10 +41,11 @@ jobs:
       - name: Install backend dependencies
         run: pip install -e ./backend
 
-      - name: Build single-file frontend template
+      - name: Build frontend bundles (split + single-file)
         working-directory: frontend
         run: |
           npm ci
+          npm run build
           npm run build:static
 
       - name: Restore accumulated SQLite database cache
@@ -59,6 +60,7 @@ jobs:
         env:
           VALUATION_DATA_DIR: ${{ github.workspace }}/data
           VALUATION_DB_PATH: ${{ github.workspace }}/data/valuation.db
+          VALUATION_FRONTEND_DIST: ${{ github.workspace }}/frontend/dist
           VALUATION_SINGLEFILE_DIST: ${{ github.workspace }}/frontend/dist-singlefile
         run: |
           python -m app.jobs seed --all
@@ -67,8 +69,8 @@ jobs:
           python -m app.jobs refresh --instrument SPY || true
           python -m app.jobs backfill-equities --years 15 || true
           python -m app.jobs refresh-equities || true
-          python -m app.jobs export --output _site/index.html
-          cp _site/index.html _site/ndx-valuation-snapshot.html
+          python -m app.jobs export-site --output-dir _site
+          python -m app.jobs export --output _site/ndx-valuation-snapshot.html
           touch _site/.nojekyll
 
       - name: Configure GitHub Pages

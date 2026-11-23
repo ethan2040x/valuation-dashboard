@@ -181,9 +181,20 @@ export const WatchlistView: React.FC<WatchlistViewProps> = ({
       <div className="wl-header">
         <div>
           <h2 className="panel__title">
-            美股自选公司估值总览
+            <span className="wl-title-row">
+              <span>美股自选公司估值总览</span>
+              {loading && items.length > 0 && (
+                <span
+                  className="wl-spinner wl-spinner--sm"
+                  title="正在刷新…"
+                  aria-label="正在刷新"
+                />
+              )}
+            </span>
             <span className="panel__subtitle">
-              共追踪 {items.length} 家公司 · 点击任意行查看下方完整走势图与分位详情
+              {loading && items.length === 0
+                ? "正在按需拉取自选公司列表与历史估值分位…"
+                : `共追踪 ${items.length} 家公司 · 点击任意行查看下方完整走势图与分位详情`}
             </span>
           </h2>
         </div>
@@ -304,11 +315,36 @@ export const WatchlistView: React.FC<WatchlistViewProps> = ({
           </thead>
           <tbody>
             {loading && items.length === 0 ? (
-              <tr>
-                <td colSpan={isStatic ? 7 : 8} className="wl-empty-cell">
-                  正在加载自选公司估值…
-                </td>
-              </tr>
+              <>
+                <tr>
+                  <td colSpan={isStatic ? 7 : 8} className="wl-loading-banner-cell">
+                    <div className="wl-loading-banner" role="status">
+                      <span className="wl-spinner" aria-hidden="true" />
+                      <span>正在按需加载自选公司估值数据…</span>
+                    </div>
+                  </td>
+                </tr>
+                {Array.from({ length: 6 }).map((_, idx) => (
+                  <tr key={`skeleton-${idx}`} className="wl-skeleton-row" aria-hidden="true">
+                    <td>
+                      <div className="wl-company">
+                        <span className="skeleton-bar skeleton-bar--ticker" />
+                        <div className="wl-company__names">
+                          <span className="skeleton-bar skeleton-bar--name" />
+                          <span className="skeleton-bar skeleton-bar--sub" />
+                        </div>
+                      </div>
+                    </td>
+                    <td><span className="skeleton-bar skeleton-bar--num" /></td>
+                    <td><span className="skeleton-bar skeleton-bar--num" /></td>
+                    <td><span className="skeleton-bar skeleton-bar--num" /></td>
+                    <td><span className="skeleton-bar skeleton-bar--track" /></td>
+                    <td><span className="skeleton-bar skeleton-bar--num" /></td>
+                    <td><span className="skeleton-bar skeleton-bar--span" /></td>
+                    {!isStatic && <td><span className="skeleton-bar skeleton-bar--act" /></td>}
+                  </tr>
+                ))}
+              </>
             ) : filteredItems.length === 0 ? (
               <tr>
                 <td colSpan={isStatic ? 7 : 8} className="wl-empty-cell">

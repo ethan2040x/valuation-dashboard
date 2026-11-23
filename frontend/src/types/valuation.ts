@@ -83,6 +83,18 @@ export interface SeriesPayload {
   series: SeriesPoint[];
 }
 
+export interface CompactSeriesData {
+  s: string[];
+  d: Array<
+    [string, number | null, number] | [string, number | null, number, number]
+  >;
+}
+
+export interface RawSeriesPayload extends Omit<SeriesPayload, "series"> {
+  series?: SeriesPoint[];
+  compact?: CompactSeriesData;
+}
+
 export interface SnapshotVariant {
   params: Record<string, string | number>;
   date: string | null;
@@ -305,15 +317,37 @@ export interface StaticSnapshotBundle {
   generated_at: string;
   indicators: IndicatorMeta[];
   snapshot: SnapshotPayload;
-  series: Record<string, Partial<Record<RangeKey, SeriesPayload>>>;
+  series: Record<string, Partial<Record<RangeKey, RawSeriesPayload>>>;
   sources?: SourcesPayload;
   snapshots?: Record<string, SnapshotPayload>;
   series_by_instrument?: Record<
     string,
-    Record<string, Partial<Record<RangeKey, SeriesPayload>>>
+    Record<string, Partial<Record<RangeKey, RawSeriesPayload>>>
   >;
   sources_by_instrument?: Record<string, SourcesPayload>;
   watchlist_overview?: WatchlistOverviewPayload;
+}
+
+export interface StaticSiteConfig {
+  dataBase: string;
+}
+
+export interface StaticSiteBootstrapPayload {
+  mode: "static_site";
+  instrument: string;
+  instruments: InstrumentMeta[];
+  generated_at: string;
+  indicators: IndicatorMeta[];
+  index_snapshots: Record<string, SnapshotPayload>;
+  index_sources: Record<string, SourcesPayload>;
+}
+
+export interface StaticSiteInstrumentBundle {
+  symbol: string;
+  kind: "index" | "equity";
+  snapshot?: SnapshotPayload;
+  sources?: SourcesPayload;
+  series: Record<string, Partial<Record<RangeKey, RawSeriesPayload>>>;
 }
 
 export interface ValuationDataProvider {
@@ -357,5 +391,6 @@ export interface ValuationDataProvider {
 declare global {
   interface Window {
     __VALUATION_SNAPSHOT__?: StaticSnapshotBundle;
+    __VALUATION_SITE__?: StaticSiteConfig;
   }
 }

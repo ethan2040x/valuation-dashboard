@@ -8,11 +8,15 @@ import type {
   IndicatorMeta,
   InstrumentMeta,
   RangeKey,
+  RawSeriesPayload,
   RefreshResult,
   SeriesPayload,
+  SeriesPoint,
   SeriesStats,
   SnapshotPayload,
   SourcesPayload,
+  StaticSiteBootstrapPayload,
+  StaticSiteInstrumentBundle,
   StaticSnapshotBundle,
   ValuationDataProvider,
   WatchlistOverviewPayload,
@@ -277,10 +281,55 @@ class ApiDataProvider implements ValuationDataProvider {
   }
 }
 
+function hydrateSeriesPayload(raw: RawSeriesPayload): SeriesPayload {
+  if (Array.isArray(raw.series)) {
+    return raw as SeriesPayload;
+  }
+  const compact = raw.compact;
+  if (!compact) {
+    return {
+      ...raw,
+      series: [],
+    };
+  }
+  const sourceTable = compact.s ?? [];
+  const points: SeriesPoint[] = (compact.d ?? []).map((row) => ({
+    date: row[0],
+    value: row[1],
+    source: sourceTable[row[2]] ?? "",
+    is_incomplete: Boolean(row[3]),
+  }));
+  const { compact: _omitted, ...rest } = raw;
+  return {
+    ...rest,
+    series: points,
+  };
+}
+
+function resolveRawSeriesRange(
+  byRange: Partial<Record<RangeKey, RawSeriesPayload>>,
+  range: RangeKey
+): SeriesPayload {
+  const direct = byRange[range];
+  if (direct) {
+    return hydrateSeriesPayload(direct);
+  }
+  const allRaw = byRange["all"];
+  if (allRaw) {
+    return sliceSeriesPayload(hydrateSeriesPayload(allRaw), range);
+  }
+  const fallback = byRange["5y"] ?? Object.values(byRange)[0];
+  if (!fallback) {
+    throw new Error(`快照中缺少区间数据: ${range}`);
+  }
+  return hydrateSeriesPayload(fallback);
+}
+
 class SnapshotDataProvider implements ValuationDataProvider {
   readonly mode = "static" as const;
   readonly snapshotGeneratedAt: string | null;
   private readonly bundle: StaticSnapshotBundle;
+  private readonly hydratedCache = new Map<string, SeriesPayload>();
 
   constructor(bundle: StaticSnapshotBundle) {
     this.bundle = bundle;
@@ -310,6 +359,9 @@ class SnapshotDataProvider implements ValuationDataProvider {
     if (this.bundle.snapshots && this.bundle.snapshots[key]) {
       return this.bundle.snapshots[key];
     }
+    if (key === this.bundle.instrument.toUpperCase()) {
+      return this.bundle.snapshot;
+    }
     return this.bundle.snapshot;
   }
 
@@ -319,31 +371,45 @@ class SnapshotDataProvider implements ValuationDataProvider {
     range: RangeKey
   ): Promise<SeriesPayload> {
     const key = instrument.toUpperCase();
+    const cacheKey = `${key}:${indicatorId}:${range}`;
+    const cached = this.hydratedCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
     const seriesMap =
-      this.bundle.series_by_instrument?.[key] ?? this.bundle.series;
-    const byRange = seriesMap[indicatorId];
+      this.bundle.series_by_instrument?.[key] ??
+      (key === this.bundle.instrument.toUpperCase() ? this.bundle.series : undefined);
+    const byRange = seriesMap?.[indicatorId];
     if (!byRange) {
       throw new Error(`快照中缺少指标序列: ${indicatorId}`);
     }
-    const direct = byRange[range];
-    if (direct) {
-      return direct;
+
+    const allCacheKey = `${key}:${indicatorId}:all`;
+    let allPayload = this.hydratedCache.get(allCacheKey);
+    if (!allPayload && byRange["all"]) {
+      allPayload = hydrateSeriesPayload(byRange["all"]);
+      this.hydratedCache.set(allCacheKey, allPayload);
     }
-    const allPayload = byRange["all"];
-    if (allPayload) {
-      return sliceSeriesPayload(allPayload, range);
-    }
-    const fallback = byRange["5y"] ?? Object.values(byRange)[0];
-    if (!fallback) {
-      throw new Error(`快照中缺少区间数据: ${indicatorId}/${range}`);
-    }
-    return fallback;
+
+    const result =
+      byRange[range] !== undefined
+        ? range === "all" && allPayload
+          ? allPayload
+          : hydrateSeriesPayload(byRange[range]!)
+        : allPayload
+          ? sliceSeriesPayload(allPayload, range)
+          : resolveRawSeriesRange(byRange, range);
+
+    this.hydratedCache.set(cacheKey, result);
+    return result;
   }
 
   async getSources(instrument: string): Promise<SourcesPayload> {
     const key = instrument.toUpperCase();
     const payload =
-      this.bundle.sources_by_instrument?.[key] ?? this.bundle.sources;
+      this.bundle.sources_by_instrument?.[key] ??
+      (key === this.bundle.instrument.toUpperCase() ? this.bundle.sources : undefined);
     if (payload) {
       return payload;
     }
@@ -371,9 +437,173 @@ class SnapshotDataProvider implements ValuationDataProvider {
   }
 }
 
+class StaticSiteDataProvider implements ValuationDataProvider {
+  readonly mode = "static" as const;
+  private _snapshotGeneratedAt: string | null = null;
+  private readonly dataBase: string;
+  private bootstrapPromise: Promise<StaticSiteBootstrapPayload> | null = null;
+  private watchlistPromise: Promise<WatchlistOverviewPayload> | null = null;
+  private readonly instrumentPromises = new Map<
+    string,
+    Promise<StaticSiteInstrumentBundle>
+  >();
+  private readonly hydratedCache = new Map<string, SeriesPayload>();
+
+  constructor(dataBase = "./data") {
+    this.dataBase = dataBase.replace(/\/+$/, "");
+  }
+
+  get snapshotGeneratedAt(): string | null {
+    return this._snapshotGeneratedAt;
+  }
+
+  private async fetchJson<T>(relPath: string): Promise<T> {
+    const res = await fetch(`${this.dataBase}/${relPath.replace(/^\/+/, "")}`);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} 加载静态数据失败: ${relPath}`);
+    }
+    return (await res.json()) as T;
+  }
+
+  private loadBootstrap(): Promise<StaticSiteBootstrapPayload> {
+    if (!this.bootstrapPromise) {
+      this.bootstrapPromise = this.fetchJson<StaticSiteBootstrapPayload>(
+        "bootstrap.json"
+      ).then((data) => {
+        this._snapshotGeneratedAt = data.generated_at ?? null;
+        return data;
+      });
+    }
+    return this.bootstrapPromise;
+  }
+
+  private loadInstrumentBundle(
+    symbol: string
+  ): Promise<StaticSiteInstrumentBundle> {
+    const key = symbol.toUpperCase();
+    let pending = this.instrumentPromises.get(key);
+    if (!pending) {
+      pending = this.fetchJson<StaticSiteInstrumentBundle>(
+        `instruments/${encodeURIComponent(key)}.json`
+      );
+      this.instrumentPromises.set(key, pending);
+    }
+    return pending;
+  }
+
+  async getInstruments(kind?: "index" | "equity"): Promise<InstrumentMeta[]> {
+    const boot = await this.loadBootstrap();
+    const normalized = (boot.instruments ?? []).map((inst) => ({
+      ...inst,
+      kind: inst.kind ?? "index",
+    }));
+    return kind ? normalized.filter((i) => i.kind === kind) : normalized;
+  }
+
+  async getIndicators(): Promise<IndicatorMeta[]> {
+    const boot = await this.loadBootstrap();
+    return boot.indicators;
+  }
+
+  async getSnapshot(instrument: string): Promise<SnapshotPayload> {
+    const key = instrument.toUpperCase();
+    const boot = await this.loadBootstrap();
+    if (boot.index_snapshots && boot.index_snapshots[key]) {
+      return boot.index_snapshots[key];
+    }
+    const instBundle = await this.loadInstrumentBundle(key);
+    if (instBundle.snapshot) {
+      return instBundle.snapshot;
+    }
+    throw new Error(`静态站点缺少 ${key} 快照数据`);
+  }
+
+  async getSources(instrument: string): Promise<SourcesPayload> {
+    const key = instrument.toUpperCase();
+    const boot = await this.loadBootstrap();
+    if (boot.index_sources && boot.index_sources[key]) {
+      return boot.index_sources[key];
+    }
+    const instBundle = await this.loadInstrumentBundle(key);
+    if (instBundle.sources) {
+      return instBundle.sources;
+    }
+    return {
+      instrument: key,
+      profile: "free_first",
+      priority: [],
+      profiles: [],
+      sources: [],
+    };
+  }
+
+  async getSeries(
+    indicatorId: string,
+    instrument: string,
+    range: RangeKey
+  ): Promise<SeriesPayload> {
+    const key = instrument.toUpperCase();
+    const cacheKey = `${key}:${indicatorId}:${range}`;
+    const cached = this.hydratedCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const instBundle = await this.loadInstrumentBundle(key);
+    const byRange = instBundle.series?.[indicatorId];
+    if (!byRange) {
+      throw new Error(`静态数据中缺少指标序列: ${key}/${indicatorId}`);
+    }
+
+    const allCacheKey = `${key}:${indicatorId}:all`;
+    let allPayload = this.hydratedCache.get(allCacheKey);
+    if (!allPayload && byRange["all"]) {
+      allPayload = hydrateSeriesPayload(byRange["all"]);
+      this.hydratedCache.set(allCacheKey, allPayload);
+    }
+
+    const result =
+      byRange[range] !== undefined
+        ? range === "all" && allPayload
+          ? allPayload
+          : hydrateSeriesPayload(byRange[range]!)
+        : allPayload
+          ? sliceSeriesPayload(allPayload, range)
+          : resolveRawSeriesRange(byRange, range);
+
+    this.hydratedCache.set(cacheKey, result);
+    return result;
+  }
+
+  async getWatchlistOverview(
+    kind: "index" | "equity" = "equity"
+  ): Promise<WatchlistOverviewPayload> {
+    if (kind !== "equity") {
+      const boot = await this.loadBootstrap();
+      return {
+        kind,
+        generated_at: boot.generated_at,
+        count: 0,
+        items: [],
+      };
+    }
+    if (!this.watchlistPromise) {
+      this.watchlistPromise = this.fetchJson<WatchlistOverviewPayload>(
+        "watchlist.json"
+      );
+    }
+    return this.watchlistPromise;
+  }
+}
+
 export function createDataProvider(): ValuationDataProvider {
-  if (typeof window !== "undefined" && window.__VALUATION_SNAPSHOT__) {
-    return new SnapshotDataProvider(window.__VALUATION_SNAPSHOT__);
+  if (typeof window !== "undefined") {
+    if (window.__VALUATION_SNAPSHOT__) {
+      return new SnapshotDataProvider(window.__VALUATION_SNAPSHOT__);
+    }
+    if (window.__VALUATION_SITE__) {
+      return new StaticSiteDataProvider(window.__VALUATION_SITE__.dataBase);
+    }
   }
   return new ApiDataProvider();
 }
