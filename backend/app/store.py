@@ -146,6 +146,12 @@ _INSTRUMENT_SELECT_COLS = (
     "id, symbol, name, kind, en_name, sector, group_name, currency, etf_ticker, description, enabled, created_at"
 )
 
+_DEFAULT_EQUITIES_SEED_VERSION = "2"
+_V1_TOP10_GROUP_NAME = "Top 10 市值"
+_V2_TOP10_GROUP_NAME = "Top 10 非金融市值"
+_V1_EXCLUDED_FINANCIAL_SYMBOLS = ("BRK.B",)
+_V2_ADDED_EQUITY_SYMBOLS = ("WMT",)
+
 _INSTRUMENT_EXCLUSIVE_JOBS: dict[str, set[str]] = {
     "qqq_holdings": {"NDX"},
     "spy_holdings": {"SPY"},
@@ -229,37 +235,83 @@ class ValuationStore:
             seeded_row = conn.execute(
                 "SELECT value FROM app_settings WHERE key = 'default_equities_seeded'"
             ).fetchone()
-            if not seeded_row or str(seeded_row["value"]) != "1":
+            current_ver = str(seeded_row["value"]) if seeded_row else None
+
+            if current_ver is None:
                 eq_count = conn.execute(
                     "SELECT COUNT(*) AS cnt FROM instruments WHERE kind = 'equity'"
                 ).fetchone()["cnt"]
                 if int(eq_count or 0) == 0:
                     for eq in DEFAULT_EQUITIES:
-                        conn.execute(
-                            """
-                            INSERT OR IGNORE INTO instruments
-                                (symbol, name, kind, en_name, sector, group_name, currency, etf_ticker, description, enabled, created_at)
-                            VALUES (?, ?, 'equity', ?, ?, ?, ?, '', ?, 1, ?)
-                            """,
-                            (
-                                eq["symbol"],
-                                eq["name"],
-                                eq.get("en_name", ""),
-                                eq.get("sector", ""),
-                                eq.get("group_name", ""),
-                                eq.get("currency", "USD"),
-                                eq.get("description", ""),
-                                ts,
-                            ),
-                        )
+                        self._insert_default_equity(conn, eq, ts)
+            elif current_ver == "1":
+                has_v1_top10 = (
+                    conn.execute(
+                        "SELECT 1 FROM instruments WHERE kind = 'equity' AND group_name = ? LIMIT 1",
+                        (_V1_TOP10_GROUP_NAME,),
+                    ).fetchone()
+                    is not None
+                )
+                if has_v1_top10:
+                    for sym in _V1_EXCLUDED_FINANCIAL_SYMBOLS:
+                        fin_row = conn.execute(
+                            "SELECT id FROM instruments WHERE symbol = ? AND kind = 'equity' AND group_name = ?",
+                            (sym, _V1_TOP10_GROUP_NAME),
+                        ).fetchone()
+                        if fin_row is not None:
+                            self._delete_instrument_by_id(conn, int(fin_row["id"]))
+
+                    conn.execute(
+                        "UPDATE instruments SET group_name = ? WHERE kind = 'equity' AND group_name = ?",
+                        (_V2_TOP10_GROUP_NAME, _V1_TOP10_GROUP_NAME),
+                    )
+
+                    added_set = set(_V2_ADDED_EQUITY_SYMBOLS)
+                    for eq in DEFAULT_EQUITIES:
+                        if eq["symbol"] in added_set:
+                            self._insert_default_equity(conn, eq, ts)
+
+            if current_ver is None or current_ver == "1":
                 conn.execute(
                     """
                     INSERT INTO app_settings (key, value, updated_at)
-                    VALUES ('default_equities_seeded', '1', ?)
-                    ON CONFLICT(key) DO UPDATE SET value = '1', updated_at = excluded.updated_at
+                    VALUES ('default_equities_seeded', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
                     """,
-                    (ts,),
+                    (_DEFAULT_EQUITIES_SEED_VERSION, ts),
                 )
+
+    @staticmethod
+    def _insert_default_equity(
+        conn: sqlite3.Connection,
+        eq: dict[str, str],
+        ts: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO instruments
+                (symbol, name, kind, en_name, sector, group_name, currency, etf_ticker, description, enabled, created_at)
+            VALUES (?, ?, 'equity', ?, ?, ?, ?, '', ?, 1, ?)
+            """,
+            (
+                eq["symbol"],
+                eq["name"],
+                eq.get("en_name", ""),
+                eq.get("sector", ""),
+                eq.get("group_name", ""),
+                eq.get("currency", "USD"),
+                eq.get("description", ""),
+                ts,
+            ),
+        )
+
+    @staticmethod
+    def _delete_instrument_by_id(conn: sqlite3.Connection, inst_id: int) -> None:
+        conn.execute("DELETE FROM equity_snapshots WHERE instrument_id = ?", (inst_id,))
+        conn.execute("DELETE FROM constituent_snapshots WHERE instrument_id = ?", (inst_id,))
+        conn.execute("DELETE FROM raw_series WHERE instrument_id = ?", (inst_id,))
+        conn.execute("DELETE FROM indicator_values WHERE instrument_id = ?", (inst_id,))
+        conn.execute("DELETE FROM instruments WHERE id = ?", (inst_id,))
 
     # ------------------------------------------------------------------
     # instruments
@@ -445,12 +497,7 @@ class ValuationStore:
                 return False
             if row["kind"] == "index":
                 raise ValueError(f"Cannot delete index instrument {symbol_upper!r}")
-            inst_id = int(row["id"])
-            conn.execute("DELETE FROM equity_snapshots WHERE instrument_id = ?", (inst_id,))
-            conn.execute("DELETE FROM constituent_snapshots WHERE instrument_id = ?", (inst_id,))
-            conn.execute("DELETE FROM raw_series WHERE instrument_id = ?", (inst_id,))
-            conn.execute("DELETE FROM indicator_values WHERE instrument_id = ?", (inst_id,))
-            conn.execute("DELETE FROM instruments WHERE id = ?", (inst_id,))
+            self._delete_instrument_by_id(conn, int(row["id"]))
             return True
 
     def get_instrument(self, symbol: str) -> dict[str, Any] | None:

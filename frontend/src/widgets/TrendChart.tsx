@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as echarts from "echarts/core";
 import { LineChart, type LineSeriesOption } from "echarts/charts";
 import {
@@ -101,6 +101,40 @@ export const TrendChart: React.FC<TrendChartProps> = ({
 }) => {
   const chartRef = useRef<HTMLDivElement | null>(null);
   const instanceRef = useRef<echarts.ECharts | null>(null);
+  const [isCompact, setIsCompact] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.innerWidth <= 640 : false
+  );
+
+  useEffect(() => {
+    const el = chartRef.current;
+    if (!el) return;
+
+    const updateSize = (width?: number) => {
+      const w = width ?? el.clientWidth;
+      if (w > 0) {
+        const nextCompact = w < 560;
+        setIsCompact((prev) => (prev === nextCompact ? prev : nextCompact));
+      }
+      instanceRef.current?.resize();
+    };
+
+    updateSize();
+
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver((entries) => {
+        const entryWidth = entries[0]?.contentRect.width;
+        updateSize(entryWidth);
+      });
+      observer.observe(el);
+      return () => observer.disconnect();
+    }
+
+    const handleResize = () => updateSize();
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, []);
 
   const chartModel = useMemo(() => {
     if (!seriesPayload || seriesPayload.series.length === 0) {
@@ -142,9 +176,9 @@ export const TrendChart: React.FC<TrendChartProps> = ({
                 formatter: `${ref.label || "均值"} ${formatValue(seriesPayload.stats.mean, indicator.display)}`,
                 position: "insideEndTop",
                 color: "#b45309",
-                fontSize: 11,
+                fontSize: isCompact ? 10 : 11,
                 backgroundColor: "rgba(255,255,255,0.85)",
-                padding: [2, 4],
+                padding: isCompact ? [1, 3] : [2, 4],
                 borderRadius: 3,
               },
             });
@@ -173,7 +207,8 @@ export const TrendChart: React.FC<TrendChartProps> = ({
                 formatter: `${ref.label} ${formatValue(ref.value, indicator.display)}`,
                 position: "insideEndTop",
                 color: "#475569",
-                fontSize: 11,
+                fontSize: isCompact ? 10 : 11,
+                padding: isCompact ? [1, 3] : [2, 4],
               },
             });
           }
@@ -206,7 +241,8 @@ export const TrendChart: React.FC<TrendChartProps> = ({
                   show: true,
                   position: "insideTopLeft",
                   color: "#3b82f6",
-                  fontSize: 11,
+                  fontSize: isCompact ? 10 : 11,
+                  padding: isCompact ? [1, 3] : [2, 4],
                 },
                 data: markAreaData,
               }
@@ -215,7 +251,7 @@ export const TrendChart: React.FC<TrendChartProps> = ({
     });
 
     return { dates, seriesList, pointByDate, distinctSources };
-  }, [indicator, seriesPayload]);
+  }, [indicator, seriesPayload, isCompact]);
 
   useEffect(() => {
     if (!chartRef.current) return;
@@ -232,19 +268,38 @@ export const TrendChart: React.FC<TrendChartProps> = ({
     const option: TrendChartOption = {
       animation: true,
       animationDuration: 300,
-      grid: { top: 44, left: 56, right: 24, bottom: 38 },
-      legend: {
-        top: 6,
-        right: 12,
-        textStyle: { color: "#475569", fontSize: 12 },
-        itemWidth: 22,
-        itemHeight: 10,
-      },
+      grid: isCompact
+        ? { top: 36, left: 42, right: 12, bottom: 28 }
+        : { top: 44, left: 56, right: 24, bottom: 38 },
+      legend: isCompact
+        ? {
+            type: "scroll",
+            top: 2,
+            left: 0,
+            right: 0,
+            textStyle: { color: "#475569", fontSize: 11 },
+            itemWidth: 16,
+            itemHeight: 8,
+            itemGap: 10,
+            pageIconSize: 10,
+          }
+        : {
+            type: "scroll",
+            top: 6,
+            right: 12,
+            textStyle: { color: "#475569", fontSize: 12 },
+            itemWidth: 22,
+            itemHeight: 10,
+          },
       tooltip: {
         trigger: "axis",
+        confine: true,
+        axisPointer: { type: "line", snap: true },
+        padding: isCompact ? [6, 8] : [8, 10],
         backgroundColor: "rgba(15, 23, 42, 0.94)",
         borderColor: "#334155",
-        textStyle: { color: "#f8fafc", fontSize: 12 },
+        textStyle: { color: "#f8fafc", fontSize: isCompact ? 11.5 : 12 },
+        extraCssText: "max-width: 85%; white-space: normal;",
         formatter: (params: unknown) => {
           const items = Array.isArray(params) ? params : [params];
           const first = items[0] as { axisValue?: string } | undefined;
@@ -268,15 +323,25 @@ export const TrendChart: React.FC<TrendChartProps> = ({
         data: chartModel.dates,
         boundaryGap: false,
         axisLine: { lineStyle: { color: "#cbd5e1" } },
-        axisLabel: { color: "#64748b", fontSize: 11 },
+        axisLabel: {
+          color: "#64748b",
+          fontSize: isCompact ? 10 : 11,
+          margin: isCompact ? 8 : 10,
+          hideOverlap: true,
+          formatter: isCompact
+            ? (val: string) => (val.length >= 7 ? val.slice(0, 7) : val)
+            : undefined,
+        },
       },
       yAxis: {
         type: "value",
         scale: true,
+        splitNumber: isCompact ? 4 : 5,
         splitLine: { lineStyle: { color: "#f1f5f9" } },
         axisLabel: {
           color: "#64748b",
-          fontSize: 11,
+          fontSize: isCompact ? 10 : 11,
+          margin: isCompact ? 6 : 8,
           formatter: (val: number) => `${val}${indicator.display.suffix}`,
         },
       },
@@ -284,13 +349,8 @@ export const TrendChart: React.FC<TrendChartProps> = ({
     };
 
     chart.setOption(option, true);
-
-    const handleResize = () => chart.resize();
-    window.addEventListener("resize", handleResize);
-    return () => {
-      window.removeEventListener("resize", handleResize);
-    };
-  }, [chartModel, indicator, seriesPayload]);
+    chart.resize();
+  }, [chartModel, indicator, seriesPayload, isCompact]);
 
   useEffect(() => {
     return () => {

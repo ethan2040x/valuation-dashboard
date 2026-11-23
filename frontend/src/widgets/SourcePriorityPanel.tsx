@@ -198,6 +198,78 @@ export const SourcePriorityPanel: React.FC<SourcePriorityPanelProps> = ({
               </tbody>
             </table>
           </div>
+
+          <div className="source-card-list" role="list" aria-label="数据源列表">
+            {sourcesPayload.sources.map((src, idx) => {
+              const tierClass =
+                src.tier === "free"
+                  ? "tier-pill--free"
+                  : src.tier === "external_csv"
+                    ? "tier-pill--csv"
+                    : "tier-pill--paid";
+              return (
+                <div
+                  key={src.id}
+                  role="listitem"
+                  className={`source-card ${
+                    src.active_in_db ? "source-card--active" : "source-card--idle"
+                  }`}
+                >
+                  <div className="source-card__top">
+                    <div className="source-card__title">
+                      <span className="source-rank">#{src.priority_rank}</span>
+                      <strong>{src.name}</strong>
+                      <span className={`tier-pill ${tierClass}`}>
+                        {formatTierLabel(src.tier)}
+                      </span>
+                    </div>
+                    {!isStatic && (
+                      <div className="source-actions">
+                        <button
+                          type="button"
+                          className="move-btn"
+                          disabled={busy || idx === 0}
+                          title="上移优先级"
+                          aria-label={`上移 ${src.name} 优先级`}
+                          onClick={() => onMovePriority?.(src.id, "up")}
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          className="move-btn"
+                          disabled={busy || idx === sourcesPayload.sources.length - 1}
+                          title="下移优先级"
+                          aria-label={`下移 ${src.name} 优先级`}
+                          onClick={() => onMovePriority?.(src.id, "down")}
+                        >
+                          ↓
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="source-card__meta">
+                    <code className="source-id-code">{src.id}</code>
+                    <div className="source-desc">{src.description}</div>
+                  </div>
+
+                  <div className="source-card__cov">
+                    <span className="source-card__cov-label">
+                      覆盖范围（{sourcesPayload.instrument}）：
+                    </span>
+                    <span
+                      className={
+                        src.active_in_db ? "source-cov--ok" : "source-cov--empty"
+                      }
+                    >
+                      {formatCoverage(src)}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
     </section>

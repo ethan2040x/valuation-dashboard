@@ -681,7 +681,7 @@ export const App: React.FC = () => {
           <p className="topbar__desc">
             {activeTab === "indices"
               ? activeInstrument.description
-              : "对比 Top 10 及自选美股的滚动 PE、前瞻 PE 与 SEC EDGAR 15 年历史估值分位"}
+              : "对比美股 Top 10（剔除金融股）及自选公司的滚动 PE、前瞻 PE 与 SEC EDGAR 15 年历史估值分位"}
           </p>
         </div>
 

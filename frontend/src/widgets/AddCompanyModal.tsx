@@ -24,11 +24,16 @@ export const AddCompanyModal: React.FC<AddCompanyModalProps> = ({
   useEffect(() => {
     if (!open) return;
     setError(null);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !busy) onClose();
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [open, busy, onClose]);
 
   if (!open) return null;
@@ -155,6 +160,11 @@ export const AddCompanyModal: React.FC<AddCompanyModalProps> = ({
           </label>
 
           {error && <div className="modal-error">{error}</div>}
+
+          <p className="form-hint">
+            提示：本看板以 PE 为核心估值指标，银行、保险、综合金融等金融股 PE
+            易失真，常规更适用 PB / ROE，添加后请谨慎参考。
+          </p>
 
           <div className="modal-footer">
             <button

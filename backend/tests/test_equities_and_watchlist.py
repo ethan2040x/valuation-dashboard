@@ -78,7 +78,11 @@ def test_legacy_db_migration_and_onetime_top10_seeding(tmp_path):
     equities = store.list_instruments(kind="equity")
     assert [i["symbol"] for i in indices] == ["NDX", "SPY"]
     assert len(equities) == len(DEFAULT_EQUITIES) == 10
-    assert {i["symbol"] for i in equities} == {e["symbol"] for e in DEFAULT_EQUITIES}
+    default_syms = {e["symbol"] for e in DEFAULT_EQUITIES}
+    assert "BRK.B" not in default_syms
+    assert "WMT" in default_syms
+    assert {i["symbol"] for i in equities} == default_syms
+    assert all(i["group_name"] == "Top 10 非金融市值" for i in equities)
 
     # Index deletion must be rejected
     with pytest.raises(ValueError, match="Cannot delete index"):
@@ -90,6 +94,124 @@ def test_legacy_db_migration_and_onetime_top10_seeding(tmp_path):
     equities_after = {i["symbol"] for i in store_reloaded.list_instruments(kind="equity")}
     assert "TSLA" not in equities_after
     assert len(equities_after) == 9
+
+
+def test_v1_top10_migration_replaces_financial_brk_with_wmt_preserving_user_edits(tmp_path):
+    """Migrating a v1 DB removes seeded BRK.B, adds WMT, updates group_name, and preserves user deletions/additions."""
+    from app.store import SCHEMA_SQL
+
+    db_path = tmp_path / "v1.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(SCHEMA_SQL)
+
+    v1_rows = [
+        ("NVDA", "英伟达", "半导体与 AI", "Top 10 市值"),
+        ("AAPL", "苹果", "消费电子", "Top 10 市值"),
+        ("MSFT", "微软", "云计算与软件", "Top 10 市值"),
+        ("AMZN", "亚马逊", "电商与云计算", "Top 10 市值"),
+        ("GOOGL", "谷歌", "互联网与 AI", "Top 10 市值"),
+        ("META", "Meta", "社交媒体与 AI", "Top 10 市值"),
+        ("AVGO", "博通", "半导体与网络", "Top 10 市值"),
+        # Omit TSLA to simulate a user-deleted Top 10 company
+        ("BRK.B", "伯克希尔 B", "综合金融", "Top 10 市值"),
+        ("LLY", "礼来", "创新药", "Top 10 市值"),
+        ("AMD", "超威半导体", "半导体", "自选股"),
+    ]
+    for sym, name, sector, grp in v1_rows:
+        conn.execute(
+            """
+            INSERT INTO instruments (symbol, name, kind, sector, group_name, enabled, created_at)
+            VALUES (?, ?, 'equity', ?, ?, 1, '2026-11-22T00:00:00+00:00')
+            """,
+            (sym, name, sector, grp),
+        )
+    brk_id = conn.execute(
+        "SELECT id FROM instruments WHERE symbol = 'BRK.B'"
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO equity_snapshots (date, instrument_id, price, eps_ttm, eps_fwd, market_cap, source, fetched_at)
+        VALUES ('2026-11-20', ?, 570.0, 35.73, 22.82, 1.21e12, 'equity+yfinance', '2026-11-22T00:00:00+00:00')
+        """,
+        (brk_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO raw_series (instrument_id, series_id, date, value, source, fetched_at)
+        VALUES (?, 'pe_ttm', '2026-11-20', 15.95, 'sec_edgar', '2026-11-22T00:00:00+00:00')
+        """,
+        (brk_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO indicator_values (indicator_id, instrument_id, date, value, params, source, is_incomplete, meta, computed_at)
+        VALUES ('pe_ttm', ?, '2026-11-20', 15.95, '{}', 'sec_edgar', 0, '{}', '2026-11-22T00:00:00+00:00')
+        """,
+        (brk_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO app_settings (key, value, updated_at)
+        VALUES ('default_equities_seeded', '1', '2026-11-22T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = ValuationStore(db_path)
+    assert store.get_setting("default_equities_seeded") == "2"
+
+    assert store.get_instrument("BRK.B") is None
+    assert store.get_instrument("TSLA") is None
+
+    wmt = store.get_instrument("WMT")
+    assert wmt is not None
+    assert wmt["group_name"] == "Top 10 非金融市值"
+
+    amd = store.get_instrument("AMD")
+    assert amd is not None
+    assert amd["group_name"] == "自选股"
+
+    equities = store.list_instruments(kind="equity")
+    by_sym = {e["symbol"]: e for e in equities}
+    assert set(by_sym.keys()) == {
+        "NVDA",
+        "AAPL",
+        "MSFT",
+        "AMZN",
+        "GOOGL",
+        "META",
+        "AVGO",
+        "LLY",
+        "WMT",
+        "AMD",
+    }
+    for sym in ("NVDA", "AAPL", "MSFT", "AMZN", "GOOGL", "META", "AVGO", "LLY", "WMT"):
+        assert by_sym[sym]["group_name"] == "Top 10 非金融市值"
+
+    # Dependent BRK.B rows must be fully cleaned up
+    with store.connect() as verify_conn:
+        for table in ("equity_snapshots", "raw_series", "indicator_values"):
+            cnt = verify_conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE instrument_id = ?",
+                (brk_id,),
+            ).fetchone()[0]
+            assert cnt == 0
+
+    # User deletes WMT and manually adds BRK.B back under custom group: must persist across reloads
+    assert store.delete_instrument("WMT") is True
+    store.upsert_instrument(
+        "BRK.B",
+        name="伯克希尔 B",
+        sector="综合金融",
+        group_name="自选股",
+    )
+
+    reloaded = ValuationStore(db_path)
+    assert reloaded.get_instrument("WMT") is None
+    brk_manual = reloaded.get_instrument("BRK.B")
+    assert brk_manual is not None
+    assert brk_manual["group_name"] == "自选股"
 
 
 def test_sec_edgar_companyfacts_q4_derivation_splits_and_clamping():

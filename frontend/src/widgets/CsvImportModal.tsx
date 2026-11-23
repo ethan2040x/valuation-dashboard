@@ -43,11 +43,16 @@ export const CsvImportModal: React.FC<CsvImportModalProps> = ({
     setTarget(defaultInstrument || "AUTO");
     setError(null);
     setResult(null);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !busy) onClose();
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, [open, busy, defaultInstrument, onClose]);
 
   if (!open) return null;
