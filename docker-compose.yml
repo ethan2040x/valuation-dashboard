@@ -1,0 +1,17 @@
+services:
+  valuation-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ndx-valuation-dashboard
+    ports:
+      - "8000:8000"
+    environment:
+      VALUATION_SCHEDULE_ENABLED: "true"
+      VALUATION_SCHEDULE_HOUR: "18"
+      VALUATION_SCHEDULE_MINUTE: "30"
+      VALUATION_SCHEDULE_TZ: "America/New_York"
+    volumes:
+      - ./data:/app/data
+      - ./dist:/app/dist
+    restart: unless-stopped
